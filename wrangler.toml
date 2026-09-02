@@ -1,0 +1,28 @@
+name = "five9-mcp"
+main = "src/index.js"
+compatibility_date = "2026-07-01"
+
+# Configuration comes from one of two places (env wins if both are set):
+#   1. The in-browser setup wizard at /setup — stores config in the KV
+#      namespace below. Easiest path; no terminal needed after deploy.
+#   2. Wrangler secrets (`npx wrangler secret put <NAME>`):
+#      FIVE9_USERNAME / FIVE9_PASSWORD / MCP_AUTH_TOKEN
+#
+# KV namespace for wizard-managed config. The `id` is intentionally omitted so
+# the namespace is auto-provisioned into the deploying account: the "Deploy to
+# Cloudflare" button and `npx wrangler deploy` both create it and write the id
+# back to this file on first deploy. (If you'd rather pin an existing namespace,
+# run `npx wrangler kv namespace create CONFIG` and add `id = "..."` below.)
+[[kv_namespaces]]
+binding = "CONFIG"
+
+# Workers AI powers generate_prompt_audio (Deepgram Aura voices) with no
+# external TTS account or API key. The binding costs nothing to declare.
+[ai]
+binding = "AI"
+
+# Optional vars (override in [vars] or the dashboard):
+[vars]
+FIVE9_API_HOST = "api.five9.com"        # EU: api.eu.five9.com  CA: api.ca.five9.com
+FIVE9_ADMIN_VERSION = "v13"             # Config Web Services WSDL version
+FIVE9_SUPERVISOR_VERSION = "v13"        # Statistics Web Services WSDL version
