@@ -30,12 +30,57 @@
 // "hours" days use three-letter names; the set must be a contiguous range in
 // Five9 day order (SUN=1 .. SAT=7), e.g. MON..FRI. Times are 24h "HH:MM" in
 // the domain's IVR time zone.
+//
+// Routing / data nodes (XML shapes derived from a live "last agent by ANI"
+// script exported off a production domain):
+//
+//   "lookup":   { "type": "lookup_contact", "field": "number1",
+//                 "variable": "Call.ANI",            // default Call.ANI
+//                 "lookup_fields": ["number1","number2","number3"], // default
+//                 "multiple_match_exception": false, "next": "found" }
+//                 Loads the matching CRM contact into Contact.* variables.
+//   "found":    { "type": "if_else", "match": "ALL",
+//                 "conditions": [ { "variable": "Contact.last_agent",
+//                                   "op": "REGEXP", "value": ".+" } ],
+//                 "then": "to_agent", "else": "overflow" }
+//                 op: EQUALS, NOT_EQUALS, CONTAINS, REGEXP, MORE_THAN, LESS_THAN.
+//                 value is a constant; use value_variable to compare to another
+//                 variable. Numeric values are written as integers.
+//   "to_agent": { "type": "agent_transfer", "agent_variable": "Contact.last_agent",
+//                 "leave_voicemail": true, "max_queue_seconds": 60,
+//                 "max_ring_seconds": 15, "next": "bye" }
+//                 Rings the agent whose USERNAME is in the variable; falls to
+//                 that agent's voicemail when leave_voicemail is true.
+//   "overflow": { "type": "third_party_transfer", "number": "3475195242",
+//                 "ringing_timeout": 10, "max_seconds": 300, "next": "bye" }
+//                 number_variable: "Contact.some_field" dials from a variable.
+//   play/menu accept "interruptible": true (caller can key through the prompt).
+//   menu accepts "no_match": "<node>" (default: replay the menu).
+//   hangup accepts "disposition": one of the built-in system dispositions
+//   (No Disposition, Caller Disconnected, Abandon, Sent To Voicemail,
+//   Transferred To 3rd Party) and "overwrite_disposition": true.
 
 import { escapeXml, parseXml, toArray } from './five9.js';
 
-export const IVR_NODE_TYPES = ['play', 'menu', 'hours', 'skill_transfer', 'voicemail', 'hangup'];
+export const IVR_NODE_TYPES = ['play', 'menu', 'hours', 'skill_transfer', 'voicemail', 'hangup', 'lookup_contact', 'if_else', 'agent_transfer', 'third_party_transfer'];
+
+export const IF_ELSE_OPS = ['EQUALS', 'NOT_EQUALS', 'CONTAINS', 'REGEXP', 'MORE_THAN', 'LESS_THAN'];
+
+// System dispositions the designer references by negative id. Custom
+// dispositions carry domain-specific ids the SOAP API does not expose, so the
+// builder only accepts these on hangup nodes.
+export const SYSTEM_DISPOSITIONS = {
+  'no disposition': { id: 0, name: 'No Disposition' },
+  'caller disconnected': { id: -17, name: 'Caller Disconnected' },
+  'abandon': { id: -5, name: 'Abandon' },
+  'sent to voicemail': { id: -20, name: 'Sent To Voicemail' },
+  'transferred to 3rd party': { id: -23, name: 'Transferred To 3rd Party' },
+};
 
 const DAY_NUM = { SUN: 1, MON: 2, TUE: 3, WED: 4, THU: 5, FRI: 6, SAT: 7 };
+
+const isVarName = (v) => typeof v === 'string' && /^[A-Za-z_][\w]*\.[A-Za-z_][\w]*$/.test(v.trim());
+const PHONE_RE = /^\+?\d{3,15}$/;
 
 // Default event prompts present in every designer script. The gzip+base64
 // payloads are byte-identical to the ones Five9's own designer writes.
@@ -96,8 +141,12 @@ export function validateFlow(flow) {
     switch (node.type) {
       case 'play': return node.next ? [node.next] : [];
       case 'hours': return [node.during_hours, node.after_hours].filter(Boolean);
-      case 'menu': return toArray(node.options).map((o) => o?.next).filter(Boolean);
+      case 'menu': return [...toArray(node.options).map((o) => o?.next), node.no_match].filter(Boolean);
       case 'skill_transfer': return node.next ? [node.next] : [];
+      case 'lookup_contact': return node.next ? [node.next] : [];
+      case 'if_else': return [node.then, node.else].filter(Boolean);
+      case 'agent_transfer': return node.next ? [node.next] : [];
+      case 'third_party_transfer': return node.next ? [node.next] : [];
       default: return [];
     }
   };
@@ -160,6 +209,61 @@ export function validateFlow(flow) {
     if (node.type === 'voicemail' && !node.skill) {
       bad(`node "${key}": voicemail needs skill (the skill voicemail box to leave the message in).`);
     }
+    if (node.type === 'hangup' && node.disposition !== undefined) {
+      if (!SYSTEM_DISPOSITIONS[String(node.disposition).toLowerCase()]) {
+        bad(`node "${key}": hangup disposition must be one of ${Object.values(SYSTEM_DISPOSITIONS).map((d) => d.name).join(', ')} (custom dispositions cannot be resolved to ids through the API — set them from the disposition list on the campaign instead).`);
+      }
+    }
+    if (node.type === 'lookup_contact') {
+      if (!node.field || typeof node.field !== 'string') bad(`node "${key}": lookup_contact needs field (the contact field to match, e.g. "number1").`);
+      const v = node.variable ?? 'Call.ANI';
+      if (!isVarName(v)) bad(`node "${key}": variable must be a Five9 variable like "Call.ANI" (got "${v}").`);
+      if (!node.next) bad(`node "${key}": lookup_contact needs next (usually an if_else that checks a Contact.* field).`);
+      const lf = toArray(node.lookup_fields);
+      if (node.lookup_fields !== undefined && (!lf.length || lf.some((f) => typeof f !== 'string' || !f.trim()))) bad(`node "${key}": lookup_fields must be a non-empty list of contact field names.`);
+    }
+    if (node.type === 'if_else') {
+      const conds = toArray(node.conditions);
+      if (!conds.length) bad(`node "${key}": if_else needs at least one condition.`);
+      for (const c of conds) {
+        if (!c || !isVarName(c.variable)) bad(`node "${key}": every condition needs variable like "Contact.last_agent".`);
+        const op = String(c?.op || 'EQUALS').toUpperCase();
+        if (!IF_ELSE_OPS.includes(op)) bad(`node "${key}": op "${c?.op}" is not one of ${IF_ELSE_OPS.join(', ')}.`);
+        if (c && c.value === undefined && c.value_variable === undefined) bad(`node "${key}": every condition needs value (constant) or value_variable.`);
+        if (c && c.value_variable !== undefined && !isVarName(c.value_variable)) bad(`node "${key}": value_variable must be a Five9 variable like "Call.ANI".`);
+        if (c && op === 'REGEXP' && typeof c.value === 'string') {
+          try { new RegExp(c.value); } catch { bad(`node "${key}": REGEXP value "${c.value}" is not a valid regular expression.`); }
+        }
+      }
+      const match = String(node.match || 'ALL').toUpperCase();
+      if (!['ALL', 'ANY'].includes(match)) bad(`node "${key}": match must be ALL or ANY.`);
+      if (!node.then) bad(`node "${key}": if_else needs then (target when the conditions hold).`);
+      if (!node.else) bad(`node "${key}": if_else needs else (target when they do not).`);
+    }
+    if (node.type === 'agent_transfer') {
+      if (!node.agent_variable) bad(`node "${key}": agent_transfer needs agent_variable — a variable holding the agent USERNAME, e.g. "Contact.last_agent".`);
+      else if (!isVarName(node.agent_variable)) bad(`node "${key}": agent_variable must be a Five9 variable like "Contact.last_agent".`);
+      if (!node.next) bad(`node "${key}": agent_transfer needs next (where the call goes if the transfer returns, usually a hangup).`);
+      const mq = node.max_queue_seconds ?? 60;
+      if (!Number.isInteger(mq) || mq < 0 || mq > 18000) bad(`node "${key}": max_queue_seconds must be 0-18000.`);
+      const mr = node.max_ring_seconds ?? 15;
+      if (!Number.isInteger(mr) || mr < 5 || mr > 120) bad(`node "${key}": max_ring_seconds must be 5-120.`);
+    }
+    if (node.type === 'third_party_transfer') {
+      const hasNum = typeof node.number === 'string' || typeof node.number === 'number';
+      const hasVar = typeof node.number_variable === 'string';
+      if (!hasNum && !hasVar) bad(`node "${key}": third_party_transfer needs number (digits only, e.g. "4692505198") or number_variable.`);
+      if (hasNum && !PHONE_RE.test(String(node.number).replace(/[\s()\-.]/g, ''))) bad(`node "${key}": number "${node.number}" must be 3-15 digits (formatting characters are stripped).`);
+      if (hasVar && !isVarName(node.number_variable)) bad(`node "${key}": number_variable must be a Five9 variable like "Contact.transfer_number".`);
+      if (!node.next) bad(`node "${key}": third_party_transfer needs next (what happens if the transfer fails or returns, usually a hangup).`);
+      const rt = node.ringing_timeout ?? 10;
+      if (!Number.isInteger(rt) || rt < 5 || rt > 120) bad(`node "${key}": ringing_timeout must be 5-120 seconds.`);
+      const mx = node.max_seconds ?? 300;
+      if (!Number.isInteger(mx) || mx < 10 || mx > 18000) bad(`node "${key}": max_seconds must be 10-18000.`);
+    }
+    if ((node.type === 'play' || node.type === 'menu') && node.interruptible !== undefined && typeof node.interruptible !== 'boolean') {
+      bad(`node "${key}": interruptible must be true or false.`);
+    }
   }
 
   // Reachability from entry.
@@ -199,9 +303,9 @@ export function collectFlowRefs(flow) {
 
 // Emit XML for one prompt slot. flags follow observed designer output: file
 // prompts keep ttsEnumed false, inline TTS marks both TTS flags true.
-function compoundPromptXml(prompt, resolved, ttsXmlBlob) {
+function compoundPromptXml(prompt, resolved, ttsXmlBlob, interruptible = false) {
   const flags = (tts) =>
-    `<interruptible>false</interruptible><canChangeInterruptableOption>true</canChangeInterruptableOption>` +
+    `<interruptible>${interruptible ? 'true' : 'false'}</interruptible><canChangeInterruptableOption>true</canChangeInterruptableOption>` +
     `<ttsEnumed>${tts}</ttsEnumed><exitModuleOnException>false</exitModuleOnException>`;
   if (prompt.prompt_name) {
     const p = resolved.prompts.get(prompt.prompt_name.toLowerCase());
@@ -211,6 +315,14 @@ function compoundPromptXml(prompt, resolved, ttsXmlBlob) {
   }
   return `<ttsPrompt><xml>${ttsXmlBlob}</xml><promptTTSEnumed>true</promptTTSEnumed></ttsPrompt>${flags(true)}`;
 }
+
+// An empty prompt slot (modules that can announce something but don't).
+const emptyPromptXml =
+  '<prompt><interruptible>false</interruptible><canChangeInterruptableOption>true</canChangeInterruptableOption><ttsEnumed>false</ttsEnumed><exitModuleOnException>false</exitModuleOnException></prompt>';
+
+// A designer "value or variable" operand.
+const stringOperand = (value) => `<isVarSelected>false</isVarSelected><stringValue><value>${escapeXml(value)}</value><id>0</id></stringValue>`;
+const variableOperand = (name) => `<isVarSelected>true</isVarSelected><variableName>${escapeXml(name)}</variableName>`;
 
 const promptChannelBoilerplate =
   '<vivrPrompts><interruptible>false</interruptible><canChangeInterruptableOption>true</canChangeInterruptableOption><ttsEnumed>false</ttsEnumed><exitModuleOnException>false</exitModuleOnException></vivrPrompts>' +
@@ -257,9 +369,13 @@ export async function composeIvrXml(flow, resolved) {
     if (node.type === 'hours') edges.push([key, node.during_hours], [key, node.after_hours]);
     if (node.type === 'menu') {
       for (const o of toArray(node.options)) edges.push([key, o.next]);
-      edges.push([key, key]); // No Match branch loops back to the menu itself
+      edges.push([key, node.no_match || key]); // No Match branch: explicit target, or replay the menu
     }
     if (node.type === 'skill_transfer' && node.next) edges.push([key, node.next]);
+    if (node.type === 'lookup_contact' && node.next) edges.push([key, node.next]);
+    if (node.type === 'if_else') edges.push([key, node.then], [key, node.else]);
+    if (node.type === 'agent_transfer' && node.next) edges.push([key, node.next]);
+    if (node.type === 'third_party_transfer' && node.next) edges.push([key, node.next]);
   }
   const idOf = (k) => (k === '__incoming__' ? incomingId : ids[k]);
   const ascendantsOf = (key) => edges.filter(([, to]) => to === key).map(([from]) => idOf(from));
@@ -312,7 +428,7 @@ export async function composeIvrXml(flow, resolved) {
       moduleXml.push(moduleEnvelope({
         ...base, tag: 'play', singleDescendant: ids[node.next],
         data:
-          `<prompt>${compoundPromptXml(node.prompt, resolved, ttsBlob)}</prompt>` +
+          `<prompt>${compoundPromptXml(node.prompt, resolved, ttsBlob, node.interruptible === true)}</prompt>` +
           disposXml(-17, 'Caller Disconnected') +
           promptChannelBoilerplate +
           '<numberOfDigits>0</numberOfDigits><terminateDigit>N/A</terminateDigit><clearDigitBuffer>false</clearDigitBuffer><collapsible>false</collapsible>' +
@@ -339,12 +455,12 @@ export async function composeIvrXml(flow, resolved) {
         data:
           disposXml(-17, 'Caller Disconnected') +
           promptChannelBoilerplate +
-          `<branches>${branchEntry('No Match', ids[key])}${opts.map((o) => branchEntry(o.label, ids[o.next])).join('')}</branches>` +
+          `<branches>${branchEntry('No Match', ids[node.no_match || key])}${opts.map((o) => branchEntry(o.label, ids[o.next])).join('')}</branches>` +
           '<useSpeechRecognition>false</useSpeechRecognition><useDTMF>true</useDTMF><recordUserInput>false</recordUserInput>' +
           `<maxAttempts>${node.max_attempts ?? 3}</maxAttempts><confidenceTreshold>60</confidenceTreshold><saveInput/><saveConfidenceLevel/>` +
           recoEvent('NO_MATCH', defaultGuid('NoMatchPrompt'), 'CONTINUE') +
           recoEvent('NO_INPUT', defaultGuid('NoInputPrompt'), 'REPROMPT') +
-          `<prompts><prompt>${compoundPromptXml(node.prompt, resolved, ttsBlob)}</prompt><count>1</count></prompts>` +
+          `<prompts><prompt>${compoundPromptXml(node.prompt, resolved, ttsBlob, node.interruptible === true)}</prompt><count>1</count></prompts>` +
           '<confirmData><confirmRequired>NOT_REQUIRED</confirmRequired><requiredConfidence>75</requiredConfidence><maxAttemptsToConfirm>3</maxAttemptsToConfirm>' +
           '<noInputTimeout>3</noInputTimeout><maxTimeToEnter>3</maxTimeToEnter><completeTimeout>0</completeTimeout><confidenceTreshold>75</confidenceTreshold>' +
           '<sensitivity>0</sensitivity><incompleteTimeout>0</incompleteTimeout><swirecNbestListLength>0</swirecNbestListLength>' +
@@ -421,12 +537,83 @@ export async function composeIvrXml(flow, resolved) {
     }
 
     if (node.type === 'hangup') {
+      const d = node.disposition ? SYSTEM_DISPOSITIONS[String(node.disposition).toLowerCase()] : { id: -17, name: 'Caller Disconnected' };
       moduleXml.push(moduleEnvelope({
         ...base, tag: 'hangup',
         data:
-          disposXml(-17, 'Caller Disconnected') +
+          disposXml(d.id, d.name) +
           '<returnToCallingModule>true</returnToCallingModule>' + errBoilerplate +
-          '<overwriteDisposition>false</overwriteDisposition>',
+          `<overwriteDisposition>${node.overwrite_disposition === true ? 'true' : 'false'}</overwriteDisposition>`,
+      }));
+    }
+
+    if (node.type === 'lookup_contact') {
+      const lookupFields = node.lookup_fields ? toArray(node.lookup_fields) : ['number1', 'number2', 'number3'];
+      moduleXml.push(moduleEnvelope({
+        ...base, tag: 'lookupCRMRecord', singleDescendant: ids[node.next],
+        data:
+          emptyPromptXml + promptChannelBoilerplate +
+          '<lookupMode>LOOKUP_IN_DB</lookupMode><criteriaType>ADVANCED</criteriaType>' +
+          lookupFields.map((f) => `<lookupCriteria>${escapeXml(f)}</lookupCriteria>`).join('') +
+          `<conditions><crmField>${escapeXml(node.field)}</crmField><operator>EQUALS</operator><value>${escapeXml(node.variable || 'Call.ANI')}</value><isVariableSelected>true</isVariableSelected></conditions>` +
+          '<groupingType>ALL</groupingType><filterExpression>1</filterExpression>' +
+          `<riseExceptionWhenManyRecordsFound>${node.multiple_match_exception === true ? 'true' : 'false'}</riseExceptionWhenManyRecordsFound>` +
+          '<saveNumberRecordsToVariable>false</saveNumberRecordsToVariable><fetchTimeout>60</fetchTimeout>',
+      }));
+    }
+
+    if (node.type === 'if_else') {
+      const conds = toArray(node.conditions);
+      const match = String(node.match || 'ALL').toUpperCase();
+      const right = (c) => {
+        if (c.value_variable !== undefined) return variableOperand(c.value_variable);
+        if (typeof c.value === 'number' && Number.isInteger(c.value)) return `<isVarSelected>false</isVarSelected><integerValue><value>${c.value}</value></integerValue>`;
+        return stringOperand(String(c.value));
+      };
+      moduleXml.push(moduleEnvelope({
+        ...base, tag: 'ifElse',
+        data:
+          `<branches><entry><key>IF</key><value><name>IF</name><desc>${ids[node.then]}</desc></value></entry>` +
+          `<entry><key>ELSE</key><value><name>ELSE</name><desc>${ids[node.else]}</desc></value></entry></branches>` +
+          `<customCondition>1</customCondition><conditionGrouping>${match}</conditionGrouping>` +
+          conds.map((c) =>
+            `<conditions><comparisonType>${String(c.op || 'EQUALS').toUpperCase()}</comparisonType><joinMode>${match === 'ANY' ? 'OR' : 'AND'}</joinMode>` +
+            `<rightOperand>${right(c)}</rightOperand>` +
+            `<leftOperand>${variableOperand(c.variable)}</leftOperand></conditions>`).join(''),
+      }));
+    }
+
+    if (node.type === 'agent_transfer') {
+      const leaveVm = node.leave_voicemail !== false;
+      moduleXml.push(moduleEnvelope({
+        ...base, tag: 'agentTransfer', singleDescendant: ids[node.next],
+        data:
+          emptyPromptXml + disposXml(-5, 'Abandon') +
+          `<transferMode>AGENT</transferMode><queueCallsWhenOnBreak>${node.queue_when_on_break === false ? 'false' : 'true'}</queueCallsWhenOnBreak>` +
+          `<maxQueueTime>${node.max_queue_seconds ?? 60}</maxQueueTime><pauseBeforeTransfer>0</pauseBeforeTransfer><maxRingTime>${node.max_ring_seconds ?? 15}</maxRingTime>` +
+          '<placeOnBreakIfNoAnswer>true</placeOnBreakIfNoAnswer><recordedFilesAction>KEEP_AS_RECORDINGD</recordedFilesAction>' +
+          `<agentButNotVarSelected>false</agentButNotVarSelected><agentToTransfer/><agentVarName>${escapeXml(node.agent_variable)}</agentVarName>` +
+          '<extension><isVarSelected>false</isVarSelected><stringValue><value>0000</value><id>0</id></stringValue></extension>' +
+          `<transferToAnyIfUnavailable>${node.transfer_to_any_if_unavailable === true ? 'true' : 'false'}</transferToAnyIfUnavailable>` +
+          `<leaveVoicemail>${leaveVm ? 'true' : 'false'}</leaveVoicemail><vmAgentButNotExtensionSelected>true</vmAgentButNotExtensionSelected><vmAgentButNotVarSelected>true</vmAgentButNotVarSelected><agentForVoicemail/>` +
+          '<voicemailExtension><isVarSelected>false</isVarSelected><stringValue><value>0000</value><id>0</id></stringValue></voicemailExtension>' +
+          '<disableMOH>false</disableMOH>',
+      }));
+    }
+
+    if (node.type === 'third_party_transfer') {
+      const numberXml = node.number_variable
+        ? variableOperand(node.number_variable)
+        : stringOperand(String(node.number).replace(/[\s()\-.]/g, ''));
+      moduleXml.push(moduleEnvelope({
+        ...base, tag: 'thirdPartyTransfer', singleDescendant: ids[node.next],
+        data:
+          emptyPromptXml + disposXml(-23, 'Transferred To 3rd Party') +
+          `<thirdPartyNumber>${numberXml}</thirdPartyNumber>` +
+          `<isRecordingEnabled>${node.record === true ? 'true' : 'false'}</isRecordingEnabled>` +
+          '<returnAfter3rdParty>false</returnAfter3rdParty><send3rdParty>false</send3rdParty><receive3rdParty>false</receive3rdParty>' +
+          `<maxTimeOf3rdParty>${node.max_seconds ?? 300}</maxTimeOf3rdParty><digitToInterrupt3rdParty></digitToInterrupt3rdParty>` +
+          `<ringingTimeout>${node.ringing_timeout ?? 10}</ringingTimeout>`,
       }));
     }
   }
@@ -479,6 +666,10 @@ function mermaidNode(id, label, type) {
     case 'menu': return `${id}{{"🔢 ${t}"}}`;
     case 'hours': case 'ifElse': return `${id}{"🕐 ${t}"}`;
     case 'skill_transfer': case 'skillTransfer': return `${id}[["🧑‍💼 ${t}"]]`;
+    case 'agent_transfer': case 'agentTransfer': return `${id}[["👤 ${t}"]]`;
+    case 'third_party_transfer': case 'thirdPartyTransfer': return `${id}[["📲 ${t}"]]`;
+    case 'lookup_contact': case 'lookupCRMRecord': return `${id}[("🔍 ${t}")]`;
+    case 'if_else': return `${id}{"❓ ${t}"}`;
     case 'voicemail': case 'voiceMailTransfer': return `${id}[/"📬 ${t}"/]`;
     case 'hangup': return `${id}((("☎️ ${t}")))`;
     default: return `${id}["${t}"]`;
@@ -502,8 +693,17 @@ export function flowToMermaid(flow) {
     }
     if (node.type === 'menu') {
       for (const o of toArray(node.options)) lines.push(`  ${nid[key]} -->|"${o.digit}: ${mermaidText(o.label)}"| ${nid[o.next]}`);
+      if (node.no_match) lines.push(`  ${nid[key]} -.->|"no match"| ${nid[node.no_match]}`);
     }
     if (node.type === 'skill_transfer' && node.next) lines.push(`  ${nid[key]} -->|"queue timeout"| ${nid[node.next]}`);
+    if (node.type === 'lookup_contact' && node.next) lines.push(`  ${nid[key]} --> ${nid[node.next]}`);
+    if (node.type === 'if_else') {
+      const label = toArray(node.conditions).map((c) => `${c.variable} ${String(c.op || 'EQUALS').toUpperCase()} ${c.value_variable ?? c.value}`).join(String(node.match || 'ALL').toUpperCase() === 'ANY' ? ' OR ' : ' AND ');
+      lines.push(`  ${nid[key]} -->|"${mermaidText(label)}"| ${nid[node.then]}`);
+      lines.push(`  ${nid[key]} -->|"else"| ${nid[node.else]}`);
+    }
+    if (node.type === 'agent_transfer' && node.next) lines.push(`  ${nid[key]} -->|"after transfer"| ${nid[node.next]}`);
+    if (node.type === 'third_party_transfer' && node.next) lines.push(`  ${nid[key]} -->|"after transfer"| ${nid[node.next]}`);
   }
   return lines.join('\n');
 }

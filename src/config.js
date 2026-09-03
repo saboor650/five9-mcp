@@ -25,6 +25,9 @@ export async function loadConfig(env) {
     restRegion: env.FIVE9_REST_REGION || stored?.restRegion || 'US',
     restBaseUrl: env.FIVE9_REST_BASE_URL || stored?.restBaseUrl || '',
     source: envManaged ? 'env' : (stored ? 'kv' : 'none'),
+    // Labels for the operator context (about tool / MCP instructions).
+    domainLabel: env.DOMAIN_LABEL || stored?.domainLabel || '',
+    clientLabel: env.CLIENT_LABEL || stored?.clientLabel || '',
     hasKv: Boolean(env.CONFIG),
     // TTS for generate_prompt_audio. Default is the Workers AI binding (no
     // account, no key); ElevenLabs/OpenAI keys are optional extras (env-only).
