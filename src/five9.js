@@ -1108,14 +1108,16 @@ export class Five9Client {
       delete next.triggerDispositions;
     }
     if (!applied.length) throw new Five9Error('Nothing to change — pass at least one field (url, trigger, trigger_dispositions, post_variables, ...).');
-    // Five9 quirk (observed live): modifyWebConnector rejects every
-    // postVariables value as an unknown CallVariable when the request carries
-    // no <variables> element at all, yet accepts the same payload once one is
-    // present. Emit an explicit empty <variables/> so POST-only connectors
-    // (no URL parameters) round-trip.
-    let xml = xmlOf(next, 'connector');
-    if (next.postVariables && !next.variables) xml = xml.replace('</connector>', '<variables/></connector>');
-    await this.admin('modifyWebConnector', xml);
+    // Five9 quirk (verified live 2026-09-03 on v13): modifyWebConnector
+    // rejects EVERY postVariables value as "Object ... of type CallVariable
+    // doesn't exist" whenever the connector has no URL variables, yet accepts
+    // the identical payload once `variables` holds at least one real pair
+    // (an empty <variables/> element does not count; createWebConnector has
+    // no such restriction). Fail with a useful message instead of Five9's.
+    if (next.postVariables && !next.variables) {
+      throw new Five9Error(`Five9 cannot modify "${name}" through the API: it has POST fields but no URL variables, and modifyWebConnector then rejects the POST fields as unknown call variables (a Five9 quirk — createWebConnector accepts the same shape). Workarounds: pass variables with one real pair in this call, e.g. {"session_id": "Call.session_id"} (Five9 appends it to the URL as a query parameter, which most webhooks ignore), or make the change in the classic admin UI.`);
+    }
+    await this.admin('modifyWebConnector', xmlOf(next, 'connector'));
     const out = { ok: true, connector: name, applied };
     if (dispositions) out.triggerDispositions = dispositions;
     return out;
