@@ -164,20 +164,22 @@ curl -X POST https://<your-worker>.workers.dev/mcp \
 
 ## 🧰 The toolbox
 
-**77 tools.** 🟢 = read (always safe) · ✏️ = write (changes your domain — the server tells AIs to confirm with you first)
+**82 tools.** 🟢 = read (always safe) · ✏️ = write (changes your domain — the server tells AIs to confirm with you first)
 
-> 69 SOAP tools (username/password) + 8 OAuth New Platform REST tools (Consumer Key/Secret — see [OAuth New Platform APIs](#-oauth-new-platform-apis)).
+> 74 SOAP tools (username/password) + 8 OAuth New Platform REST tools (Consumer Key/Secret — see [OAuth New Platform APIs](#-oauth-new-platform-apis)).
 
 <details open>
 <summary><strong>🧩 IVR builder — whole call flows from plain English</strong></summary>
 
-The headline trick: describe a call flow in a paragraph and the AI designs it, shows you a **Mermaid diagram in chat**, and deploys a working IVR script. The model never freestyles Five9's IVR XML: it fills a constrained JSON flow spec (play / menu / business-hours / skill transfer / voicemail / hangup), a graph validator checks every branch and reference, and deterministic code emits designer-shaped XML (module wiring, prompt encoding, and field order all derived from real exported scripts).
+The headline trick: describe a call flow in a paragraph and the AI designs it, shows you a **Mermaid diagram in chat**, and deploys a working IVR script. The model never freestyles Five9's IVR XML: it fills a constrained JSON flow spec (play / menu / business-hours / skill transfer / voicemail / hangup, plus the routing nodes **lookup_contact / if_else / agent_transfer / third_party_transfer** for CRM-driven flows such as "send the caller back to the last agent who spoke with them"), a graph validator checks every branch and reference, and deterministic code emits designer-shaped XML (module wiring, prompt encoding, and field order all derived from real exported scripts).
 
 | | Tool | What it does |
 |--|------|--------------|
 | 🟢 | `validate_ivr_flow` | Graph-check a flow spec + verify referenced skills/prompts exist on the domain |
 | 🟢 | `render_ivr_flow` | Render a flow spec **or an existing IVR script** as a Mermaid flowchart |
 | ✏️ | `build_ivr_script` | Compose the full script XML and create it on the domain (`dry_run` to inspect first) |
+| 🟢 | `list_ivr_modules` | Inventory of an existing script: every module, its type, and its wiring resolved to module **names** (menu keys → targets, transfer numbers, prompts, agent-transfer variables, if/else conditions) |
+| ✏️ | `patch_ivr_script` | Surgical edits to an existing script by module name — change a transfer number, swap a prompt, retarget/add/remove a menu key, change an if/else condition, the agent-transfer variable, the lookup field, a hangup disposition, rename a module. Dry run by default; everything else in the XML stays byte-identical |
 | ✏️ | `generate_prompt_audio` | Voice a prompt with a modern AI voice and upload it as a Five9-ready G.711 u-law WAV. **No API key needed**: powered by Workers AI (Deepgram Aura, ~40 voices) built into your Worker |
 
 Recommended flow: validate → render (show the human!) → generate prompts → build → attach to an inbound campaign. `generate_prompt_audio` runs on **Cloudflare Workers AI** out of the box: no external TTS account, no API key, fractions of a cent per prompt billed to the Cloudflare account you already deployed to. ElevenLabs/OpenAI work too if you set their key secrets, and `{tts}` prompts (Five9's built-in robot voice) need nothing at all.
@@ -263,6 +265,7 @@ Recommended flow: validate → render (show the human!) → generate prompts →
 |--|------|--------------|
 | 🟢 | `list_users` | List users with general info |
 | 🟢 | `get_user_details` | One user's full record: roles, skills, groups |
+| ✏️ | `bulk_create_users` | Provision many users from CSV text (the client's onboarding sheet): dry run validates rows, existing usernames and skills, then creates with roles/skills/extension; temporary passwords generated |
 | ✏️ | `create_user` | Create a user with roles, skills, and groups |
 | ✏️ | `modify_user` | Edit a user's info — pass only the changes |
 | ✏️ | `delete_user` | Delete a user |
@@ -293,8 +296,9 @@ Recommended flow: validate → render (show the human!) → generate prompts →
 | 🟢 | `list_call_variables` | Call variables and variable groups |
 | ✏️ | `manage_call_variable` | Create / delete custom call variables |
 | 🟢 | `list_web_connectors` | Web connector integrations |
-| ✏️ | `manage_web_connector` | Create / delete web connectors (URL pops agents trigger) |
+| ✏️ | `manage_web_connector` | Create / **modify** / delete web connectors — trigger (incl. `OnCallDispositioned`), the disposition list that fires it (replace or add/remove), POST-body and URL fields, silent server-side execution |
 | ✏️ | `manage_speed_dial` | List / create / delete speed-dial codes |
+| ✏️ | `modify_vcc_configuration` | Change domain-wide VCC settings (default campaign for manual calls, time-zone assignment, campaign priority, password policies …) — read-modify-write |
 | 🟢 | `get_vcc_configuration` | Domain-level VCC settings |
 
 </details>
@@ -306,6 +310,7 @@ Recommended flow: validate → render (show the human!) → generate prompts →
 |--|------|--------------|
 | 🟢 | `run_report` | Kick off any report by folder + name, optional time range |
 | 🟢 | `get_report_result` | Poll for the report's CSV output |
+| 🟢 | `find_calls` | "What happened to that call?" — runs the Call Log for a window, waits, and filters by ANI / DNIS / agent / campaign / disposition / call type / session id, returning rows instead of CSV |
 | 🟢 | `get_realtime_stats` | AgentState, ACDStatus, CampaignState, campaign statistics (incl. dialer-manager & autodial views) |
 
 </details>
@@ -355,7 +360,20 @@ Then run `rest_check_connection` to confirm the token flow. What each credential
 
 ## 🎨 Customizing the operator context
 
-`src/about.js` holds the text served to connected AIs via the MCP `instructions` field and the `about` tool: who operates the server, why it exists, and how the AI should behave (e.g. *"confirm before write actions"*). **Edit it to describe your own deployment** — it ships with the original operator's context as an example.
+`src/about.js` holds the text served to connected AIs via the MCP `instructions` field and the `about` tool: who operates the server, why it exists, and how the AI should behave (e.g. *"confirm before write actions"*). **Edit it to describe your own deployment.** This fork ships Lion Mountain's implementation-engineer context: never handle credentials, one Worker per client domain, confirm every write, dry-run bulk tools, and playbooks for IVR builds, last-agent affinity, outbound dialer setup and user onboarding. Set `DOMAIN_LABEL` / `CLIENT_LABEL` in `wrangler.toml` (or the dashboard) so the AI knows which client domain it is on.
+
+## 🦁 Lion Mountain extensions
+
+This fork adds, on top of upstream:
+
+- `manage_web_connector modify` — the connector trigger-disposition checklist and POST fields are editable through the API (no more classic-admin round trips when a disposition is added).
+- Routing nodes in the IVR builder — `lookup_contact`, `if_else`, `agent_transfer`, `third_party_transfer`, `interruptible` prompts, `no_match` targets and hangup dispositions, with XML shapes cloned from a production script.
+- `list_ivr_modules` + `patch_ivr_script` — read and surgically edit existing scripts by module name, dry run first.
+- `modify_vcc_configuration` — default manual-call campaign, time-zone assignment, campaign priority and the rest of Actions → Configure.
+- `find_calls` — Call Log lookup with filters, rows out.
+- `bulk_create_users` — CSV-driven provisioning with a validating dry run.
+
+Tests: `npm test` (37 tests across the upstream suite and `test/extensions.test.mjs`, which runs the IVR patcher against a real exported script).
 
 ## 🏗️ Architecture
 
