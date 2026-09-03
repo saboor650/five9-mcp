@@ -395,3 +395,13 @@ test('new tools are registered, grouped, and write-flagged', () => {
   const wc = TOOLS.find((t) => t.name === 'manage_web_connector');
   assert.deepEqual(wc.inputSchema.properties.action.enum, ['create', 'modify', 'delete']);
 });
+
+test('tool handlers accept JSON-string array/object params from stale clients', async () => {
+  const wc = TOOLS.find((t) => t.name === 'manage_web_connector');
+  const f9 = { manageWebConnector: async (action, f) => ({ action, f }) };
+  const r = await wc.handler(f9, { action: 'modify', name: 'c', add_trigger_dispositions: '["A", "B"]', post_variables: '{"k": "Call.ANI"}' });
+  assert.deepEqual(r.f.addTriggerDispositions, ['A', 'B']);
+  assert.deepEqual(r.f.postVariables, { k: 'Call.ANI' });
+  const r2 = await wc.handler(f9, { action: 'modify', name: 'c', add_trigger_dispositions: ['A'] });
+  assert.deepEqual(r2.f.addTriggerDispositions, ['A']);
+});
