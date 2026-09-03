@@ -33,6 +33,7 @@ const CONNECTOR = {
   startPageText: 'Please wait', trigger: 'OnCallDispositioned',
   triggerDispositions: ['Consult Set', 'No Answer'],
   url: 'https://example.test/hook',
+  variables: [{ key: 'session_id', value: 'Call.session_id' }], // Five9 needs >=1 URL variable to modify POST fields
 };
 
 // ---- manage_web_connector modify ----
@@ -60,6 +61,7 @@ test('modifyWebConnector replaces POST fields from a {key: value} object and can
     removeTriggerDispositions: ['No Answer'], url: 'https://example.test/v2',
   });
   assert.deepEqual(r.applied.sort(), ['postVariables', 'triggerDispositions', 'url']);
+  assert.ok(f9.calls.at(-1).xml.includes('<variables><key>session_id</key><value>Call.session_id</value></variables>'), 'existing URL variable round-trips');
   const doc = parseXml(`<r>${f9.calls.at(-1).xml}</r>`).r.connector;
   assert.deepEqual(toArray(doc.postVariables).map((p) => p.key), ['user_name', 'DNIS']);
   assert.deepEqual(toArray(doc.triggerDispositions), ['Consult Set']);
@@ -404,4 +406,16 @@ test('tool handlers accept JSON-string array/object params from stale clients', 
   assert.deepEqual(r.f.postVariables, { k: 'Call.ANI' });
   const r2 = await wc.handler(f9, { action: 'modify', name: 'c', add_trigger_dispositions: ['A'] });
   assert.deepEqual(r2.f.addTriggerDispositions, ['A']);
+});
+
+test('modifyWebConnector refuses POST-only connectors with a clear message (Five9 quirk)', async () => {
+  const postOnly = { ...CONNECTOR, variables: undefined };
+  const f9 = mockClient({ getWebConnectors: { return: postOnly } });
+  await assert.rejects(() => f9.modifyWebConnector('wfa-last-agent-call-ended', { url: 'https://example.test/v3' }), /no URL variables/);
+  assert.ok(!f9.calls.some((c) => c.method === 'modifyWebConnector'), 'nothing sent to Five9');
+  // Supplying one URL variable in the same call unblocks it.
+  const r = await f9.modifyWebConnector('wfa-last-agent-call-ended', { url: 'https://example.test/v3', variables: { session_id: 'Call.session_id' } });
+  assert.deepEqual(r.applied.sort(), ['url', 'variables']);
+  const doc = parseXml(`<r>${f9.calls.at(-1).xml}</r>`).r.connector;
+  assert.equal(doc.variables.value, 'Call.session_id');
 });
