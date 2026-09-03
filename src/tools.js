@@ -9,6 +9,16 @@ import { listIvrModules, patchIvrXml } from './ivrpatch.js';
 import { synthesizeUlawWav } from './tts.js';
 import { findCalls, bulkCreateUsers } from './ops.js';
 
+// MCP clients that cached an older tool schema pass unknown array/object
+// parameters as JSON *strings*. Accept both shapes so a stale client still
+// works after a deploy adds parameters.
+function jsonish(v) {
+  if (typeof v !== 'string') return v;
+  const t = v.trim();
+  if (!(t.startsWith('[') || t.startsWith('{'))) return v;
+  try { return JSON.parse(t); } catch { return v; }
+}
+
 export const TOOLS = [
   {
     name: 'about',
@@ -883,8 +893,8 @@ export const TOOLS = [
     },
     handler: (f9, a) => f9.manageWebConnector(a.action, {
       name: a.name, url: a.url, description: a.description, trigger: a.trigger,
-      triggerDispositions: a.trigger_dispositions, addTriggerDispositions: a.add_trigger_dispositions, removeTriggerDispositions: a.remove_trigger_dispositions,
-      postVariables: a.post_variables, variables: a.variables, postConstants: a.post_constants,
+      triggerDispositions: jsonish(a.trigger_dispositions), addTriggerDispositions: jsonish(a.add_trigger_dispositions), removeTriggerDispositions: jsonish(a.remove_trigger_dispositions),
+      postVariables: jsonish(a.post_variables), variables: jsonish(a.variables), postConstants: jsonish(a.post_constants),
       agentApplication: a.agent_application, postMethod: a.post_method, executeInBrowser: a.execute_in_browser,
       addWorksheet: a.add_worksheet, startPageText: a.start_page_text,
     }),
@@ -900,7 +910,7 @@ export const TOOLS = [
       required: ['changes'],
       additionalProperties: false,
     },
-    handler: (f9, a) => f9.modifyVCCConfiguration(a.changes),
+    handler: (f9, a) => f9.modifyVCCConfiguration(jsonish(a.changes)),
   },
   {
     name: 'manage_campaign_profile_filter',
@@ -1215,7 +1225,7 @@ export const TOOLS = [
       },
       additionalProperties: false,
     },
-    handler: (f9, a) => findCalls(f9, { hours: a.hours, start: a.start, end: a.end, ani: a.ani, dnis: a.dnis, agent: a.agent, campaign: a.campaign, disposition: a.disposition, callType: a.call_type, sessionId: a.session_id, callId: a.call_id, limit: a.limit, columns: a.columns, folderName: a.folder_name, reportName: a.report_name }),
+    handler: (f9, a) => findCalls(f9, { hours: a.hours, start: a.start, end: a.end, ani: a.ani, dnis: a.dnis, agent: a.agent, campaign: a.campaign, disposition: a.disposition, callType: a.call_type, sessionId: a.session_id, callId: a.call_id, limit: a.limit, columns: jsonish(a.columns), folderName: a.folder_name, reportName: a.report_name }),
   },
   {
     name: 'bulk_create_users',
@@ -1236,7 +1246,7 @@ export const TOOLS = [
       additionalProperties: false,
     },
     handler: (f9, a) => bulkCreateUsers(f9, a.csv, { dryRun: a.dry_run, skipExisting: a.skip_existing, revealPasswords: a.reveal_passwords,
-      defaults: { roles: a.default_roles, skills: a.default_skills, userProfileName: a.default_user_profile, agentGroups: a.default_agent_groups } }),
+      defaults: { roles: jsonish(a.default_roles), skills: jsonish(a.default_skills), userProfileName: a.default_user_profile, agentGroups: jsonish(a.default_agent_groups) } }),
   },
   {
     name: 'list_ivr_modules',
@@ -1269,10 +1279,10 @@ export const TOOLS = [
     handler: async (f9, a) => {
       const script = await f9.getIVRScript(a.script_name);
       const resolved = { prompts: new Map() };
-      if (toArray(a.ops).some((o) => o?.op === 'set_prompt')) {
+      if (toArray(jsonish(a.ops)).some((o) => o?.op === 'set_prompt')) {
         for (const p of await f9.getPrompts()) resolved.prompts.set(String(p.name).toLowerCase(), { id: p.id ?? 0, name: p.name });
       }
-      const { xml, changes } = patchIvrXml(script.xmlDefinition, a.ops, resolved);
+      const { xml, changes } = patchIvrXml(script.xmlDefinition, jsonish(a.ops), resolved);
       const dryRun = a.dry_run !== false;
       const out = { script: a.script_name, dry_run: dryRun, changes, modules_after: listIvrModules(xml).module_count };
       if (a.return_xml) out.xml = xml;
