@@ -1108,7 +1108,14 @@ export class Five9Client {
       delete next.triggerDispositions;
     }
     if (!applied.length) throw new Five9Error('Nothing to change — pass at least one field (url, trigger, trigger_dispositions, post_variables, ...).');
-    await this.admin('modifyWebConnector', xmlOf(next, 'connector'));
+    // Five9 quirk (observed live): modifyWebConnector rejects every
+    // postVariables value as an unknown CallVariable when the request carries
+    // no <variables> element at all, yet accepts the same payload once one is
+    // present. Emit an explicit empty <variables/> so POST-only connectors
+    // (no URL parameters) round-trip.
+    let xml = xmlOf(next, 'connector');
+    if (next.postVariables && !next.variables) xml = xml.replace('</connector>', '<variables/></connector>');
+    await this.admin('modifyWebConnector', xml);
     const out = { ok: true, connector: name, applied };
     if (dispositions) out.triggerDispositions = dispositions;
     return out;
