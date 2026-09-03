@@ -366,7 +366,7 @@ Then run `rest_check_connection` to confirm the token flow. What each credential
 
 This fork adds, on top of upstream:
 
-- `manage_web_connector modify` — the connector trigger-disposition checklist and POST fields are editable through the API (no more classic-admin round trips when a disposition is added).
+- `manage_web_connector modify` — the connector trigger-disposition checklist and POST fields are editable through the API (no more classic-admin round trips when a disposition is added). **Five9 quirk (verified live on v13):** `modifyWebConnector` rejects every POST field as an unknown call variable when the connector has no URL variables; the tool refuses with an explanation, and passing one real URL variable (e.g. `{"session_id": "Call.session_id"}`) in the same call unblocks it. `createWebConnector` has no such restriction.
 - Routing nodes in the IVR builder — `lookup_contact`, `if_else`, `agent_transfer`, `third_party_transfer`, `interruptible` prompts, `no_match` targets and hangup dispositions, with XML shapes cloned from a production script.
 - `list_ivr_modules` + `patch_ivr_script` — read and surgically edit existing scripts by module name, dry run first.
 - `modify_vcc_configuration` — default manual-call campaign, time-zone assignment, campaign priority and the rest of Actions → Configure.

@@ -44,10 +44,12 @@ prove against a live domain.
 1. `about` — confirm it says Orchard Technologies Inc / Lion Mountain.
 2. `list_ivr_modules` on "Orchard Main IVR" — inventory should match the designer.
 3. `patch_ivr_script` with `dry_run: true` and one `rename_module` op — review the change list.
-4. `manage_web_connector modify` on `wfa-last-agent-call-ended` with `add_trigger_dispositions: ["No Answer"]`
-   (already present, so a no-op change) — then `list_web_connectors` to confirm the list is intact.
-   **This is the one live call the WSDL element order matters for**; if Five9 rejects it, the
-   fault text names the offending element — send it back and the order table in `five9.js` gets fixed.
+4. `manage_web_connector modify` — verified live on 2026-09-03: trigger dispositions, URL, and POST
+   fields all round-trip. One Five9 quirk: a connector with POST fields but **no URL variables**
+   cannot be modified (Five9 rejects the POST fields as unknown call variables); the tool says so
+   and accepts `variables: {"session_id": "Call.session_id"}` in the same call as the workaround.
+   `wfa-last-agent-call-ended` is such a connector — add that URL variable once (the WFA webhook
+   ignores query parameters) and it becomes API-editable.
 5. `modify_vcc_configuration` with a value already in place, e.g.
    `{"miscOptions": {"voicemailTimeout": 20}}` — then `get_vcc_configuration`.
 6. `find_calls` with `hours: 24, ani: "<your test phone>"`.
