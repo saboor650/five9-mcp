@@ -1,11 +1,13 @@
 // MCP tool definitions + dispatch. Each tool maps to one or two Five9 SOAP
 // calls and returns plain JSON for the model.
 
-import { Five9Client } from './five9.js';
+import { Five9Client, toArray } from './five9.js';
 import { Five9RestClient } from './five9rest.js';
-import { ABOUT } from './about.js';
-import { validateFlow, collectFlowRefs, composeIvrXml, flowToMermaid, scriptXmlToMermaid, IVR_NODE_TYPES } from './ivr.js';
+import { buildAbout } from './about.js';
+import { validateFlow, collectFlowRefs, composeIvrXml, flowToMermaid, scriptXmlToMermaid, IVR_NODE_TYPES, IF_ELSE_OPS } from './ivr.js';
+import { listIvrModules, patchIvrXml } from './ivrpatch.js';
 import { synthesizeUlawWav } from './tts.js';
+import { findCalls, bulkCreateUsers } from './ops.js';
 
 export const TOOLS = [
   {
@@ -13,7 +15,7 @@ export const TOOLS = [
     description: 'Who operates this server, why it exists, and how to work with it. Call this when you need context about the operator or ground rules.',
     inputSchema: { type: 'object', properties: {}, additionalProperties: false },
     five9: false,
-    handler: () => ABOUT,
+    handler: (_f9, _a, cfg) => buildAbout({ domainLabel: cfg?.domainLabel || 'the configured Five9 domain', clientLabel: cfg?.clientLabel || 'the client' }),
   },
   {
     name: 'check_connection',
@@ -855,23 +857,50 @@ export const TOOLS = [
   },
   {
     name: 'manage_web_connector',
-    description: 'Create or delete a web connector (URL pop / webhook agents trigger). Create: name + url, optional description, trigger (OnCallAccepted, OnCallDisconnected, ManuallyStarted [default], ManuallyStartedAllowDuringPreviews, OnPreview), agent_application (EmbeddedBrowser [default] or ExternalBrowser), post_method, execute_in_browser.',
+    description: 'Create, modify, or delete a web connector (URL pop / webhook fired by agent or call events). Create needs name + url. Modify is read-modify-write: pass only what changes. trigger: ManuallyStarted [create default], ManuallyStartedAllowDuringPreviews, OnCallAccepted, OnCallDisconnected, OnCallDispositioned, OnPreview, OnContactSelection. For OnCallDispositioned connectors, trigger_dispositions REPLACES the list of dispositions that fire it, while add_trigger_dispositions / remove_trigger_dispositions edit it incrementally (all by exact disposition name). post_variables / variables / post_constants are the URL or POST-body fields: either [{key, value}] or a {key: value} object where value is a Five9 variable name (e.g. "Agent.user_name", "Call.ANI", "Customer.number1") or a constant; each list REPLACES the existing list when given. Set post_method true for a POST body, execute_in_browser false for a silent server-side call.',
     inputSchema: {
       type: 'object',
       properties: {
-        action: { type: 'string', enum: ['create', 'delete'] },
+        action: { type: 'string', enum: ['create', 'modify', 'delete'] },
         name: { type: 'string', description: 'Connector name' },
-        url: { type: 'string', description: 'Target URL (create)' },
+        url: { type: 'string', description: 'Target URL' },
         description: { type: 'string' },
-        trigger: { type: 'string', enum: ['OnCallAccepted', 'OnCallDisconnected', 'ManuallyStarted', 'ManuallyStartedAllowDuringPreviews', 'OnPreview'] },
+        trigger: { type: 'string', description: 'ManuallyStarted, ManuallyStartedAllowDuringPreviews, OnCallAccepted, OnCallDisconnected, OnCallDispositioned, OnPreview, OnContactSelection (other Five9 connectorTrigger values pass through unchanged)' },
+        trigger_dispositions: { type: 'array', items: { type: 'string' }, description: 'OnCallDispositioned only: full list of disposition names that fire the connector (replaces the current list)' },
+        add_trigger_dispositions: { type: 'array', items: { type: 'string' }, description: 'modify: disposition names to add to the trigger list' },
+        remove_trigger_dispositions: { type: 'array', items: { type: 'string' }, description: 'modify: disposition names to remove from the trigger list' },
+        post_variables: { description: 'POST-body fields: [{key, value}] or {key: value}; value is a Five9 variable name or constant', anyOf: [{ type: 'array', items: { type: 'object', additionalProperties: true } }, { type: 'object', additionalProperties: true }] },
+        variables: { description: 'URL query fields: [{key, value}] or {key: value}', anyOf: [{ type: 'array', items: { type: 'object', additionalProperties: true } }, { type: 'object', additionalProperties: true }] },
+        post_constants: { description: 'Constant POST-body fields: [{key, value}] or {key: value}', anyOf: [{ type: 'array', items: { type: 'object', additionalProperties: true } }, { type: 'object', additionalProperties: true }] },
         agent_application: { type: 'string', enum: ['EmbeddedBrowser', 'ExternalBrowser'] },
         post_method: { type: 'boolean' },
-        execute_in_browser: { type: 'boolean' },
+        execute_in_browser: { type: 'boolean', description: 'false = fire silently from the Five9 server (no agent browser window)' },
+        add_worksheet: { type: 'boolean' },
+        start_page_text: { type: 'string' },
       },
       required: ['action', 'name'],
       additionalProperties: false,
     },
-    handler: (f9, a) => f9.manageWebConnector(a.action, { name: a.name, url: a.url, description: a.description, trigger: a.trigger, agentApplication: a.agent_application, postMethod: a.post_method, executeInBrowser: a.execute_in_browser }),
+    handler: (f9, a) => f9.manageWebConnector(a.action, {
+      name: a.name, url: a.url, description: a.description, trigger: a.trigger,
+      triggerDispositions: a.trigger_dispositions, addTriggerDispositions: a.add_trigger_dispositions, removeTriggerDispositions: a.remove_trigger_dispositions,
+      postVariables: a.post_variables, variables: a.variables, postConstants: a.post_constants,
+      agentApplication: a.agent_application, postMethod: a.post_method, executeInBrowser: a.execute_in_browser,
+      addWorksheet: a.add_worksheet, startPageText: a.start_page_text,
+    }),
+  },
+  {
+    name: 'modify_vcc_configuration',
+    description: 'Change domain-wide VCC settings (classic admin Actions -> Configure). Read-modify-write: pass only the settings to change, nested like get_vcc_configuration returns them. Common: {"miscOptions": {"defaultCampaign": "<campaign>", "maySelectCampaign": false}} sets the default campaign for manual calls and forces agents to always use it; {"timeZoneAssignment": "POSTCODE_THEN_PHONE_NUMBER"} picks how a contact\'s time zone is detected (PHONE_NUMBER, POSTCODE_THEN_PHONE_NUMBER, STATE_THEN_PHONE_NUMBER); {"campaignsSettings": {"priorityEnabled": true}} enables campaign priority; passwordPolicies, agentProductivity, extensionSettings and emailProperties are also editable. Run get_vcc_configuration first and confirm with the user — this affects every agent on the domain.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        changes: { type: 'object', description: 'Nested settings to change (same shape as get_vcc_configuration)', additionalProperties: true },
+      },
+      required: ['changes'],
+      additionalProperties: false,
+    },
+    handler: (f9, a) => f9.modifyVCCConfiguration(a.changes),
   },
   {
     name: 'manage_campaign_profile_filter',
@@ -1068,7 +1097,7 @@ export const TOOLS = [
   //   4. build_ivr_script (dry_run first if you want to inspect the XML)
   {
     name: 'validate_ivr_flow',
-    description: 'Validate an IVR flow spec BEFORE building: graph checks (entry, wiring, digits, reachability) plus, by default, domain checks that every referenced skill and prompt exists. Flow spec: { entry, nodes: { key: node } } where node types are ' + IVR_NODE_TYPES.join(', ') + '. play: {prompt, next}. menu: {prompt, options: [{digit, label, next}], max_attempts?}. hours: {days: ["MON".."FRI"], open: "08:00", close: "17:00", during_hours, after_hours}. skill_transfer: {skills: [...], next (queue-timeout fallback), max_queue_seconds?}. voicemail: {skill}. hangup: {}. Prompts are {tts: "text"} (robot voice) or {prompt_name: "X"} (domain prompt, e.g. AI voice from generate_prompt_audio).',
+    description: 'Validate an IVR flow spec BEFORE building: graph checks (entry, wiring, digits, reachability) plus, by default, domain checks that every referenced skill and prompt exists. Flow spec: { entry, nodes: { key: node } } where node types are ' + IVR_NODE_TYPES.join(', ') + '. play: {prompt, next}. menu: {prompt, options: [{digit, label, next}], max_attempts?}. hours: {days: ["MON".."FRI"], open: "08:00", close: "17:00", during_hours, after_hours}. skill_transfer: {skills: [...], next (queue-timeout fallback), max_queue_seconds?}. voicemail: {skill}. hangup: {disposition? (system dispositions only), overwrite_disposition?}. Routing/data nodes: lookup_contact: {field: "number1", variable?: "Call.ANI", lookup_fields?, next} loads the matching CRM contact into Contact.* variables; if_else: {conditions: [{variable: "Contact.last_agent", op: EQUALS|NOT_EQUALS|CONTAINS|REGEXP|MORE_THAN|LESS_THAN, value | value_variable}], match?: ALL|ANY, then, else}; agent_transfer: {agent_variable: "Contact.last_agent" (holds the agent USERNAME), leave_voicemail?: true, max_queue_seconds?, max_ring_seconds?, next}; third_party_transfer: {number: "4692505198" | number_variable, ringing_timeout?, max_seconds?, next}. play/menu take interruptible?: true; menu takes no_match?: "<node>" (default replays the menu). Prompts are {tts: "text"} (robot voice) or {prompt_name: "X"} (domain prompt, e.g. AI voice from generate_prompt_audio). Last-agent routing pattern: menu -> lookup_contact(number1 = Call.ANI) -> if_else(Contact.last_agent REGEXP ".+") -> then agent_transfer(Contact.last_agent) / else third_party_transfer(overflow number).',
     inputSchema: {
       type: 'object',
       properties: {
@@ -1163,6 +1192,98 @@ export const TOOLS = [
     },
   },
   {
+    name: 'find_calls',
+    description: 'Find recent calls and what happened to them (agent, campaign, disposition, call type, ANI/DNIS, timestamps) by running the standard "Call Log" report for a time window and filtering it. Filters match loosely: ani/dnis by trailing digits (formatting ignored), agent/campaign/disposition/call_type by case-insensitive substring, session_id/call_id exactly. Default window is the last 24 hours (hours), or pass start/end ISO timestamps. Waits for the report (usually 5-30 s); if it is still running, the response carries an identifier for get_report_result. Use this instead of run_report + get_report_result when the question is "did the call to 555-1234 get dispositioned / who took it".',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        hours: { type: 'number', description: 'Look back this many hours from now (default 24, max 744)' },
+        start: { type: 'string', description: 'ISO-8601 window start (overrides hours; requires end)' },
+        end: { type: 'string', description: 'ISO-8601 window end' },
+        ani: { type: 'string', description: 'Caller/customer number (any formatting)' },
+        dnis: { type: 'string', description: 'Dialed number' },
+        agent: { type: 'string', description: 'Agent username or name fragment' },
+        campaign: { type: 'string' },
+        disposition: { type: 'string' },
+        call_type: { type: 'string', description: 'e.g. Inbound, Manual, Outbound' },
+        session_id: { type: 'string' },
+        call_id: { type: 'string' },
+        limit: { type: 'integer', description: 'Max rows to return (default 50, max 500) — the most recent are kept' },
+        columns: { type: 'array', items: { type: 'string' }, description: 'Only return these report columns' },
+        folder_name: { type: 'string', description: 'Report folder (default "Call Log Reports")' },
+        report_name: { type: 'string', description: 'Report name (default "Call Log")' },
+      },
+      additionalProperties: false,
+    },
+    handler: (f9, a) => findCalls(f9, { hours: a.hours, start: a.start, end: a.end, ani: a.ani, dnis: a.dnis, agent: a.agent, campaign: a.campaign, disposition: a.disposition, callType: a.call_type, sessionId: a.session_id, callId: a.call_id, limit: a.limit, columns: a.columns, folderName: a.folder_name, reportName: a.report_name }),
+  },
+  {
+    name: 'bulk_create_users',
+    description: 'Provision many Five9 users from CSV text in one go (the onboarding spreadsheet a client sends). Header columns (case-insensitive, aliases accepted): username (or email), first name, last name, email, roles (agent|admin|supervisor|reporting, separated by ; or |), skills (names, ; separated), agent groups, extension, user profile, phone, active, password (optional — a random temporary password is generated otherwise; users must change it at first login). Runs as a DRY RUN by default: validates every row, checks usernames against the domain and that every skill exists, and returns the plan. Re-run with dry_run false to create. skip_existing true skips usernames already on the domain instead of blocking. This creates real logins — restate the count and roles and get explicit confirmation before dry_run false.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        csv: { type: 'string', description: 'CSV text including the header line' },
+        dry_run: { type: 'boolean', description: 'Validate and plan only (default true)' },
+        skip_existing: { type: 'boolean', description: 'Skip usernames that already exist instead of stopping (default false)' },
+        reveal_passwords: { type: 'boolean', description: 'Echo the generated temporary passwords in the result (default false)' },
+        default_roles: { type: 'array', items: { type: 'string' }, description: 'Roles for rows without a roles column (default ["agent"])' },
+        default_skills: { type: 'array', items: { type: 'string' }, description: 'Skills for rows without a skills column' },
+        default_user_profile: { type: 'string', description: 'User profile for rows without one' },
+        default_agent_groups: { type: 'array', items: { type: 'string' } },
+      },
+      required: ['csv'],
+      additionalProperties: false,
+    },
+    handler: (f9, a) => bulkCreateUsers(f9, a.csv, { dryRun: a.dry_run, skipExisting: a.skip_existing, revealPasswords: a.reveal_passwords,
+      defaults: { roles: a.default_roles, skills: a.default_skills, userProfileName: a.default_user_profile, agentGroups: a.default_agent_groups } }),
+  },
+  {
+    name: 'list_ivr_modules',
+    description: 'Inventory of an EXISTING IVR script: every module with its type, name, and wiring resolved to module names (menu keys and where they go, transfer numbers, prompts, agent-transfer variables, lookup fields, if/else conditions, hangup dispositions). Much smaller than get_ivr_script and the right first step before patch_ivr_script. Module names are the handles patch_ivr_script uses.',
+    inputSchema: {
+      type: 'object',
+      properties: { script_name: { type: 'string', description: 'Exact IVR script name' } },
+      required: ['script_name'],
+      additionalProperties: false,
+    },
+    handler: async (f9, a) => {
+      const script = await f9.getIVRScript(a.script_name);
+      return { script: a.script_name, ...listIvrModules(script.xmlDefinition) };
+    },
+  },
+  {
+    name: 'patch_ivr_script',
+    description: 'Make targeted edits to an EXISTING IVR script without hand-editing its XML. Each op names a module (from list_ivr_modules) and what to change; everything else in the script is left byte-for-byte as it was. Ops: set_transfer_number {module, number}; set_prompt {module, prompt_name} (play/menu main prompt, must exist on the domain); set_interruptible {module, value}; set_agent_variable {module, variable} (e.g. "Contact.last_agent"); set_menu_option {module, digit, next, label?} (retargets an existing key or adds a new one; next is a module NAME); remove_menu_option {module, digit}; set_no_match {module, next}; set_condition {module, variable, comparison, value | value_variable} (if/else; replaces its conditions; comparison: ' + IF_ELSE_OPS.join(', ') + '); set_hangup_disposition {module, disposition, overwrite?} (system dispositions only); rename_module {module, new_name}; set_lookup_field {module, field, variable?}. ALWAYS run with dry_run true first and show the user the change list; then run again with dry_run false to push. Take a copy with get_ivr_script before the first real push on a script you care about.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        script_name: { type: 'string', description: 'Exact IVR script name' },
+        ops: { type: 'array', items: { type: 'object', additionalProperties: true }, description: 'Ordered list of { op, module, ... } edits' },
+        dry_run: { type: 'boolean', description: 'true = report the changes and return nothing to Five9 (default true)' },
+        return_xml: { type: 'boolean', description: 'Include the patched XML in the response (large; default false)' },
+      },
+      required: ['script_name', 'ops'],
+      additionalProperties: false,
+    },
+    handler: async (f9, a) => {
+      const script = await f9.getIVRScript(a.script_name);
+      const resolved = { prompts: new Map() };
+      if (toArray(a.ops).some((o) => o?.op === 'set_prompt')) {
+        for (const p of await f9.getPrompts()) resolved.prompts.set(String(p.name).toLowerCase(), { id: p.id ?? 0, name: p.name });
+      }
+      const { xml, changes } = patchIvrXml(script.xmlDefinition, a.ops, resolved);
+      const dryRun = a.dry_run !== false;
+      const out = { script: a.script_name, dry_run: dryRun, changes, modules_after: listIvrModules(xml).module_count };
+      if (a.return_xml) out.xml = xml;
+      if (dryRun) { out.note = 'Nothing was sent to Five9. Re-run with dry_run: false to apply these changes.'; return out; }
+      await f9.modifyIVRScript(a.script_name, xml, script.description);
+      out.applied = true;
+      out.note = 'Script updated. Open it once in the IVR designer (or place a test call) to confirm Five9 accepted the wiring.';
+      return out;
+    },
+  },
+  {
     name: 'generate_prompt_audio',
     description: 'Generate a voice prompt with a MODERN AI voice and upload it to Five9 as a WAV prompt (auto-converted to the required G.711 u-law 8kHz mono). Default provider is Cloudflare Workers AI (Deepgram Aura-2) built into this Worker: no external TTS account or API key needed, ~40 voices (default "luna"; try asteria, orion, athena, zeus). ElevenLabs/OpenAI are optional alternatives when their API-key secrets are set. Use instead of manage_tts_prompt when the prompt should sound human. The uploaded prompt can then be referenced from flows as {prompt_name}.',
     inputSchema: {
@@ -1209,11 +1330,11 @@ export const TOOL_GROUPS = [
   { name: 'Dialing lists & leads', icon: '📋', tools: ['list_dialing_lists', 'create_list', 'delete_list', 'add_record_to_list', 'add_records_to_list', 'delete_record_from_list', 'get_import_result'] },
   { name: 'CRM contacts', icon: '👤', tools: ['search_contacts', 'update_contact', 'bulk_update_contacts', 'delete_contact', 'list_contact_fields', 'manage_contact_field'] },
   { name: 'Compliance', icon: '🚫', tools: ['manage_dnc', 'get_dialing_rules'] },
-  { name: 'Users & skills', icon: '🧑‍💼', tools: ['list_users', 'get_user_details', 'create_user', 'modify_user', 'delete_user', 'set_user_roles', 'list_user_profiles', 'list_skills', 'get_skill_details', 'manage_skill', 'manage_user_skills', 'list_agent_groups', 'manage_agent_group', 'manage_reason_code'] },
-  { name: 'Domain configuration', icon: '🏢', tools: ['list_dispositions', 'manage_disposition', 'list_ivr_scripts', 'get_ivr_script', 'manage_ivr_script', 'list_prompts', 'manage_tts_prompt', 'manage_wav_prompt', 'list_dnis', 'list_call_variables', 'manage_call_variable', 'list_web_connectors', 'manage_web_connector', 'manage_speed_dial', 'get_vcc_configuration'] },
-  { name: 'Reporting & real-time', icon: '📈', tools: ['run_report', 'get_report_result', 'get_realtime_stats'] },
+  { name: 'Users & skills', icon: '🧑‍💼', tools: ['list_users', 'get_user_details', 'create_user', 'bulk_create_users', 'modify_user', 'delete_user', 'set_user_roles', 'list_user_profiles', 'list_skills', 'get_skill_details', 'manage_skill', 'manage_user_skills', 'list_agent_groups', 'manage_agent_group', 'manage_reason_code'] },
+  { name: 'Domain configuration', icon: '🏢', tools: ['list_dispositions', 'manage_disposition', 'list_ivr_scripts', 'get_ivr_script', 'manage_ivr_script', 'list_prompts', 'manage_tts_prompt', 'manage_wav_prompt', 'list_dnis', 'list_call_variables', 'manage_call_variable', 'list_web_connectors', 'manage_web_connector', 'manage_speed_dial', 'get_vcc_configuration', 'modify_vcc_configuration'] },
+  { name: 'Reporting & real-time', icon: '📈', tools: ['run_report', 'get_report_result', 'find_calls', 'get_realtime_stats'] },
   { name: 'New Platform (REST)', icon: '🆕', tools: ['rest_call', 'manage_circle', 'list_np_prompts', 'list_interaction_dispositions', 'get_domain_info', 'list_data_tables', 'get_data_table_rows'] },
-  { name: 'IVR builder', icon: '🧩', tools: ['validate_ivr_flow', 'render_ivr_flow', 'build_ivr_script', 'generate_prompt_audio'] },
+  { name: 'IVR builder', icon: '🧩', tools: ['validate_ivr_flow', 'render_ivr_flow', 'build_ivr_script', 'list_ivr_modules', 'patch_ivr_script', 'generate_prompt_audio'] },
 ];
 
 export const WRITE_TOOLS = new Set([
@@ -1227,6 +1348,7 @@ export const WRITE_TOOLS = new Set([
   'manage_tts_prompt', 'manage_wav_prompt', 'manage_ivr_script', 'manage_agent_group',
   'manage_call_variable', 'manage_web_connector', 'manage_speed_dial', 'manage_reason_code',
   'manage_circle', 'rest_call', 'build_ivr_script', 'generate_prompt_audio',
+  'modify_vcc_configuration', 'patch_ivr_script', 'bulk_create_users',
 ]);
 
 export function toolDefs() {

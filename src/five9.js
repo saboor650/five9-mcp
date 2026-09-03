@@ -132,6 +132,20 @@ const ELEMENT_ORDERS = {
   spd: ['code', 'description', 'number'],
   // Tier-2 types
   connector: ['addWorksheet', 'agentApplication', 'clearTriggerDispositions', 'constants', 'ctiWebServices', 'description', 'executeInBrowser', 'name', 'postConstants', 'postMethod', 'postVariables', 'startPageText', 'trigger', 'triggerDispositions', 'url', 'variables'],
+  postVariables: ['key', 'value'],
+  postConstants: ['key', 'value'],
+  variables: ['key', 'value'],
+  constants: ['key', 'value'],
+  // vccConfiguration (getVCCConfiguration / modifyVCCConfiguration)
+  configuration: ['agentProductivity', 'campaignsSettings', 'domainId', 'domainName', 'emailProperties', 'extensionSettings', 'keyPerfomanceIndicators', 'miscOptions', 'passwordPolicies', 'recordingsServer', 'reportsServer', 'saleforceEmailAccount', 'stateDialingRule', 'timeZoneAssignment', 'transcriptsServer'],
+  agentProductivity: ['longACWTime', 'longCallDuration', 'longHoldDuration', 'longParkDuration', 'shortACWTime', 'shortCallDuration'],
+  campaignsSettings: ['gracefulAgentStateTransitionDelay', 'gracefulAgentStateTransitionModeEnabled', 'priorityEnabled', 'ratioEnabled'],
+  emailProperties: ['emailAddress', 'maxAttachmentSize', 'newUserNotification'],
+  extensionSettings: ['maximalExtensionLength', 'minimalExtensionLength', 'minimalGeneratedExtension'],
+  keyPerfomanceIndicators: ['minTimeOfResponse', 'speedOfAnswer'],
+  miscOptions: ['defaultCampaign', 'enableReasonCodes', 'internalCallTimeout', 'maySelectCampaign', 'maySelectNone', 'showDialAttempts', 'voicemailTimeout'],
+  passwordPolicies: ['adminLoginAttempts', 'enforcePasswordHistory', 'loginAttempts', 'minCapitalCharacters', 'minNumberCharacters', 'minPasswordLength', 'minSpecialCharacters', 'passwordExpires'],
+  saleforceEmailAccount: ['enabled', 'userName'],
   grouping: ['expression', 'type'],
   addCriteria: ['compareOperator', 'leftValue', 'rightValue'],
   removeCriteria: ['compareOperator', 'leftValue', 'rightValue'],
@@ -150,6 +164,30 @@ export function xmlOf(value, name, order) {
     return `<${name}>${inner}</${name}>`;
   }
   return `<${name}>${escapeXml(value)}</${name}>`;
+}
+
+// Normalize a keyValuePair list: accepts [{key, value}], or a plain
+// { key: value } object, and returns [{ key, value }].
+export function kvPairs(input) {
+  if (input === undefined || input === null) return [];
+  if (Array.isArray(input)) {
+    return input.filter((p) => p && typeof p === 'object' && String(p.key ?? '') !== '')
+      .map((p) => ({ key: String(p.key), value: String(p.value ?? '') }));
+  }
+  if (typeof input === 'object') {
+    return Object.entries(input).filter(([k]) => k !== '').map(([key, value]) => ({ key, value: String(value ?? '') }));
+  }
+  throw new Five9Error('Expected a list of {key, value} pairs or a {key: value} object.');
+}
+
+// "a.b.c" style list of the leaf keys in a nested changes object.
+export function flattenKeys(obj, prefix = '') {
+  const out = [];
+  for (const [k, v] of Object.entries(obj || {})) {
+    if (v && typeof v === 'object' && !Array.isArray(v)) out.push(...flattenKeys(v, `${prefix}${k}.`));
+    else out.push(`${prefix}${k}`);
+  }
+  return out;
 }
 
 // Merge scalar/nested changes into a fetched object (case-tolerant on keys).
@@ -977,8 +1015,21 @@ export class Five9Client {
     return { ok: true, user: userName, added: Object.keys(rolesToSet), removed: rm };
   }
 
-  // Web connectors — create/delete. (modifyWebConnector's read-modify-write
-  // round-trip is finicky about nested keyValuePair fields; left out for now.)
+  // Web connectors — create / modify / delete.
+  //
+  // The connector type carries three keyValuePair lists (postVariables,
+  // postConstants and variables — the URL-parameter and POST-body fields) plus
+  // the trigger and, for OnCallDispositioned, the list of dispositions that
+  // fire it. Five9 returns triggerDispositions as repeated <triggerDispositions>
+  // strings; to REPLACE that list on modify, send clearTriggerDispositions=true
+  // together with the new list (otherwise Five9 unions the two).
+  async getWebConnector(name) {
+    const all = await this.getWebConnectors(name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'));
+    const c = all.find((x) => x.name === name);
+    if (!c) throw new Five9Error(`Web connector "${name}" not found.`);
+    return c;
+  }
+
   async manageWebConnector(action, fields = {}) {
     if (action === 'delete') {
       if (!fields.name) throw new Five9Error('name is required.');
@@ -987,20 +1038,96 @@ export class Five9Client {
     }
     if (action === 'create') {
       if (!fields.name || !fields.url) throw new Five9Error('name and url are required.');
+      const trigger = fields.trigger || 'ManuallyStarted';
       const connector = {
         addWorksheet: fields.addWorksheet ?? false,
         agentApplication: fields.agentApplication || 'EmbeddedBrowser',
         description: fields.description,
         executeInBrowser: fields.executeInBrowser ?? true,
         name: fields.name,
+        postConstants: kvPairs(fields.postConstants),
         postMethod: fields.postMethod ?? false,
-        trigger: fields.trigger || 'ManuallyStarted',
+        postVariables: kvPairs(fields.postVariables),
+        trigger,
         url: fields.url,
+        variables: kvPairs(fields.variables),
       };
+      const dispositions = toArray(fields.triggerDispositions);
+      if (dispositions.length) {
+        if (trigger !== 'OnCallDispositioned') throw new Five9Error('trigger_dispositions only apply when trigger is OnCallDispositioned.');
+        connector.triggerDispositions = dispositions;
+      }
       await this.admin('createWebConnector', xmlOf(connector, 'connector'));
-      return { ok: true, created: fields.name };
+      return { ok: true, created: fields.name, trigger, triggerDispositions: dispositions };
     }
-    throw new Five9Error(`Unknown action "${action}" — use create or delete.`);
+    if (action === 'modify') {
+      if (!fields.name) throw new Five9Error('name is required.');
+      return this.modifyWebConnector(fields.name, fields);
+    }
+    throw new Five9Error(`Unknown action "${action}" — use create, modify, or delete.`);
+  }
+
+  // Read-modify-write on an existing connector. `changes` may include any
+  // scalar connector field (url, description, trigger, postMethod,
+  // executeInBrowser, agentApplication, addWorksheet, startPageText,
+  // ctiWebServices), the three keyValuePair lists (postVariables,
+  // postConstants, variables — each REPLACES the list when given), and
+  // triggerDispositions plus addTriggerDispositions / removeTriggerDispositions.
+  async modifyWebConnector(name, changes = {}) {
+    const current = await this.getWebConnector(name);
+    const next = { ...current };
+    const applied = [];
+    for (const k of ['url', 'description', 'trigger', 'postMethod', 'executeInBrowser', 'agentApplication', 'addWorksheet', 'startPageText', 'ctiWebServices']) {
+      if (changes[k] !== undefined) { next[k] = changes[k]; applied.push(k); }
+    }
+    for (const k of ['postVariables', 'postConstants', 'variables']) {
+      if (changes[k] !== undefined) { next[k] = kvPairs(changes[k]); applied.push(k); }
+    }
+    // Five9 returns an empty constants placeholder ({ key: '' }) on connectors
+    // with no constants; drop empty pairs so we never write a blank key.
+    for (const k of ['postVariables', 'postConstants', 'variables', 'constants']) {
+      next[k] = toArray(next[k]).filter((p) => p && String(p.key ?? '') !== '');
+      if (!next[k].length) delete next[k];
+    }
+
+    const existing = toArray(current.triggerDispositions).map(String);
+    let dispositions = null;
+    if (changes.triggerDispositions !== undefined) dispositions = toArray(changes.triggerDispositions).map(String);
+    if (changes.addTriggerDispositions || changes.removeTriggerDispositions) {
+      dispositions = dispositions || [...existing];
+      for (const d of toArray(changes.addTriggerDispositions)) if (!dispositions.includes(String(d))) dispositions.push(String(d));
+      const rm = new Set(toArray(changes.removeTriggerDispositions).map(String));
+      dispositions = dispositions.filter((d) => !rm.has(d));
+    }
+    if (dispositions) {
+      if (next.trigger !== 'OnCallDispositioned') throw new Five9Error(`Trigger dispositions only apply to OnCallDispositioned connectors (this one is ${next.trigger}). Pass trigger: "OnCallDispositioned" in the same call to switch it.`);
+      next.clearTriggerDispositions = true;
+      next.triggerDispositions = dispositions;
+      applied.push('triggerDispositions');
+    } else {
+      delete next.triggerDispositions;
+    }
+    if (!applied.length) throw new Five9Error('Nothing to change — pass at least one field (url, trigger, trigger_dispositions, post_variables, ...).');
+    await this.admin('modifyWebConnector', xmlOf(next, 'connector'));
+    const out = { ok: true, connector: name, applied };
+    if (dispositions) out.triggerDispositions = dispositions;
+    return out;
+  }
+
+  // Domain-wide VCC configuration (Actions -> Configure in the classic admin).
+  // Read-modify-write: fetch the whole configuration, merge nested changes
+  // (e.g. { miscOptions: { defaultCampaign: "X", maySelectCampaign: false } }
+  // or { timeZoneAssignment: "POSTCODE_THEN_PHONE_NUMBER" }) and send it back.
+  async modifyVCCConfiguration(changes = {}) {
+    if (!changes || !Object.keys(changes).length) throw new Five9Error('changes must contain at least one setting (e.g. {"miscOptions": {"defaultCampaign": "Main Inbound"}}).');
+    const current = await this.getVCCConfiguration();
+    const merged = mergeChanges(current, changes);
+    // domainId/domainName are identity fields, not settings — Five9 rejects
+    // attempts to change them, and they are harmless to echo back unchanged.
+    merged.domainId = current.domainId;
+    merged.domainName = current.domainName;
+    await this.admin('modifyVCCConfiguration', xmlOf(merged, 'configuration'));
+    return { ok: true, applied: flattenKeys(changes) };
   }
 
   // Campaign-profile CRM filter criteria + result ordering.

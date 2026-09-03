@@ -4,7 +4,7 @@
 import { Five9Error, Five9Client } from './five9.js';
 import { toolDefs, callTool } from './tools.js';
 import { handleOAuth, checkAuth, unauthorized } from './oauth.js';
-import { INSTRUCTIONS } from './about.js';
+import { buildInstructions } from './about.js';
 import { landingPage, consolePage, setupPage } from './ui.js';
 import { loadConfig, saveConfig, randomToken } from './config.js';
 
@@ -112,6 +112,14 @@ async function handleSetup(request, env, cfg) {
   });
 }
 
+// cfg labels -> about/instructions options (falls back to generic wording).
+function labelsOf(cfg) {
+  return {
+    domainLabel: cfg?.domainLabel || 'the configured Five9 domain',
+    clientLabel: cfg?.clientLabel || 'the client',
+  };
+}
+
 async function handleMessage(msg, env) {
   if (!msg || typeof msg !== 'object' || msg.jsonrpc !== '2.0') {
     return rpcError(msg?.id ?? null, -32600, 'Invalid JSON-RPC 2.0 request');
@@ -129,7 +137,7 @@ async function handleMessage(msg, env) {
           protocolVersion: PROTOCOL_VERSIONS.includes(requested) ? requested : PROTOCOL_VERSIONS[0],
           capabilities: { tools: {} },
           serverInfo: SERVER_INFO,
-          instructions: INSTRUCTIONS,
+          instructions: buildInstructions(labelsOf(env)),
         });
       }
       case 'ping':
