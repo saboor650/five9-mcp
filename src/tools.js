@@ -1457,7 +1457,7 @@ export function toolDefs() {
 async function resolvePromptIds(cfg, names) {
   const wanted = new Set(names.map((n) => String(n).toLowerCase()));
   const byName = new Map();
-  const rest = new Five9RestClient(cfg);
+  const rest = makeRest(cfg);
   let cursor = null;
   do {
     const page = await rest.listNpPrompts({ cursor, limit: 100 });
@@ -1470,10 +1470,24 @@ async function resolvePromptIds(cfg, names) {
   return byName;
 }
 
+// Build a REST client that can find its own domain id. FIVE9_DOMAIN_ID is
+// optional configuration, not a prerequisite: when it is unset, the SOAP
+// getVCCConfiguration call (same domain, credentials we already hold) supplies
+// it on first use and the client caches it for the rest of the request.
+export function makeRest(cfg) {
+  return new Five9RestClient({
+    ...cfg,
+    domainIdResolver: cfg?.domainIdResolver || (async () => {
+      const conf = await new Five9Client(cfg).getVCCConfiguration();
+      return conf?.domainId ?? conf?.configuration?.domainId ?? '';
+    }),
+  });
+}
+
 export async function callTool(cfg, name, args) {
   const tool = TOOLS.find((t) => t.name === name);
   if (!tool) throw new Error(`Unknown tool: ${name}`);
-  if (tool.rest) return tool.handler(new Five9RestClient(cfg), args || {}, cfg);
+  if (tool.rest) return tool.handler(makeRest(cfg), args || {}, cfg);
   const f9 = tool.five9 === false ? null : new Five9Client(cfg);
   return tool.handler(f9, args || {}, cfg);
 }
