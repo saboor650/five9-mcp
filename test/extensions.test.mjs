@@ -419,3 +419,16 @@ test('modifyWebConnector refuses POST-only connectors with a clear message (Five
   const doc = parseXml(`<r>${f9.calls.at(-1).xml}</r>`).r.connector;
   assert.equal(doc.variables.value, 'Call.session_id');
 });
+
+// list_phone_numbers / get_campaign_digital: the raw /numbers/v1 records are
+// ~120 lines each and the REST campaign LIST silently omits the digital
+// fields, so both tools exist to fold/lift. Guard the shapes.
+test('list_phone_numbers and get_campaign_digital are registered and read-only', () => {
+  const names = TOOLS.map((t) => t.name);
+  for (const n of ['list_phone_numbers', 'get_campaign_digital']) {
+    assert.ok(names.includes(n), `${n} is registered`);
+    const t = TOOLS.find((x) => x.name === n);
+    assert.equal(t.rest, true, `${n} uses the REST client`);
+    assert.ok(!WRITE_TOOLS.has(n), `${n} is read-only, not a write tool`);
+  }
+});
