@@ -850,6 +850,21 @@ export const TOOLS = [
     }),
   },
   {
+    name: 'set_agent_permissions',
+    description: 'Turn individual AGENT permissions on or off for a user (ReceiveTransfer, CreateChatSessions, CanTransferChatsToAgents, CanTransferChatsToSkills, CanRejectCalls, CanWrapCall, SendMessages, ManageAvailabilityBySkill, ...). Reads the current permission set and MERGES your changes, so permissions you do not name are left alone. Run get_user_details first to see the exact permission names and current values. Note: users built from the blank Create User form start with almost every agent permission false.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        user_name: { type: 'string', description: 'Exact Five9 username' },
+        enable: { type: 'array', items: { type: 'string' }, description: 'Permission types to set true' },
+        disable: { type: 'array', items: { type: 'string' }, description: 'Permission types to set false' },
+      },
+      required: ['user_name'],
+      additionalProperties: false,
+    },
+    handler: (f9, a) => f9.setAgentPermissions(a.user_name, { enable: a.enable, disable: a.disable }),
+  },
+  {
     name: 'set_user_roles',
     description: 'Grant and/or revoke Five9 roles on a user. add enables roles (agent, admin, supervisor, reporting, crmManager); remove revokes them. The supervisor role requires at least one viewable tab — by default it grants Agents/Campaigns/CallMonitoring, or pass permissions.supervisor with an explicit list of tabs (Users, Agents, CallMonitoring, Stations, Campaigns, CampaignManagement, AllSkills, BargeInMonitor, WhisperMonitor, ReviewVoiceRecordings, …). Use get_user_details to see current roles.',
     inputSchema: {
@@ -1174,18 +1189,41 @@ export const TOOLS = [
       required: ['name', 'flow'],
       additionalProperties: false,
     },
-    handler: async (f9, a) => {
+    handler: async (f9, a, cfg) => {
       const refs = collectFlowRefs(a.flow);
       const resolved = { skills: new Map(), prompts: new Map() };
       if (refs.skills.length) {
         for (const s of await f9.getSkills('.*')) resolved.skills.set(String(s.name).toLowerCase(), { id: s.id, name: s.name });
       }
       if (refs.prompts.length) {
-        // The SOAP prompt list carries no ids; Five9 accepts file-prompt refs
-        // with id 0 + the prompt NAME and normalizes ids server-side
-        // (verified by round-trip against a live domain).
+        // Names come from SOAP (authoritative for "does it exist"); ids come
+        // from the New Platform prompts API. id 0 saves but fails at runtime —
+        // see resolvePromptIds.
         for (const p of await f9.getPrompts()) {
-          resolved.prompts.set(String(p.name).toLowerCase(), { id: p.id ?? 0, name: p.name });
+          resolved.prompts.set(String(p.name).toLowerCase(), { id: 0, name: p.name });
+        }
+        let ids;
+        try {
+          ids = await resolvePromptIds(cfg, refs.prompts);
+        } catch (e) {
+          throw new Error(
+            `Could not look up prompt ids via the New Platform prompts API (${e.message}). ` +
+            'build_ivr_script needs real prompt ids: a file prompt written with id 0 saves fine but fails at ' +
+            'runtime with IVR error 1600 "Invalid prompt name". Configure the OAuth credential ' +
+            '(rest_check_connection), or use { tts } prompts, or build the script in the IVR designer.'
+          );
+        }
+        for (const [key, v] of ids) resolved.prompts.set(key, v);
+        const unresolved = refs.prompts.filter((n) => {
+          const r = resolved.prompts.get(String(n).toLowerCase());
+          return !r || !r.id || String(r.id) === '0';
+        });
+        if (unresolved.length) {
+          throw new Error(
+            `No prompt id found for: ${unresolved.join(', ')}. These exist by name but the New Platform prompts ` +
+            'API returned no id, so the script would fail at runtime with IVR error 1600 "Invalid prompt name". ' +
+            'Re-select the prompt in the IVR designer, or use { tts } instead.'
+          );
         }
       }
       const { xml, warnings, moduleCount } = await composeIvrXml(a.flow, resolved);
@@ -1340,7 +1378,7 @@ export const TOOL_GROUPS = [
   { name: 'Dialing lists & leads', icon: '📋', tools: ['list_dialing_lists', 'create_list', 'delete_list', 'add_record_to_list', 'add_records_to_list', 'delete_record_from_list', 'get_import_result'] },
   { name: 'CRM contacts', icon: '👤', tools: ['search_contacts', 'update_contact', 'bulk_update_contacts', 'delete_contact', 'list_contact_fields', 'manage_contact_field'] },
   { name: 'Compliance', icon: '🚫', tools: ['manage_dnc', 'get_dialing_rules'] },
-  { name: 'Users & skills', icon: '🧑‍💼', tools: ['list_users', 'get_user_details', 'create_user', 'bulk_create_users', 'modify_user', 'delete_user', 'set_user_roles', 'list_user_profiles', 'list_skills', 'get_skill_details', 'manage_skill', 'manage_user_skills', 'list_agent_groups', 'manage_agent_group', 'manage_reason_code'] },
+  { name: 'Users & skills', icon: '🧑‍💼', tools: ['list_users', 'get_user_details', 'create_user', 'bulk_create_users', 'modify_user', 'delete_user', 'set_user_roles', 'set_agent_permissions', 'list_user_profiles', 'list_skills', 'get_skill_details', 'manage_skill', 'manage_user_skills', 'list_agent_groups', 'manage_agent_group', 'manage_reason_code'] },
   { name: 'Domain configuration', icon: '🏢', tools: ['list_dispositions', 'manage_disposition', 'list_ivr_scripts', 'get_ivr_script', 'manage_ivr_script', 'list_prompts', 'manage_tts_prompt', 'manage_wav_prompt', 'list_dnis', 'list_call_variables', 'manage_call_variable', 'list_web_connectors', 'manage_web_connector', 'manage_speed_dial', 'get_vcc_configuration', 'modify_vcc_configuration'] },
   { name: 'Reporting & real-time', icon: '📈', tools: ['run_report', 'get_report_result', 'find_calls', 'get_realtime_stats'] },
   { name: 'New Platform (REST)', icon: '🆕', tools: ['rest_call', 'manage_circle', 'list_np_prompts', 'list_interaction_dispositions', 'get_domain_info', 'list_data_tables', 'get_data_table_rows'] },
@@ -1357,12 +1395,37 @@ export const WRITE_TOOLS = new Set([
   'delete_user', 'manage_disposition', 'manage_contact_field', 'delete_contact',
   'manage_tts_prompt', 'manage_wav_prompt', 'manage_ivr_script', 'manage_agent_group',
   'manage_call_variable', 'manage_web_connector', 'manage_speed_dial', 'manage_reason_code',
-  'manage_circle', 'rest_call', 'build_ivr_script', 'generate_prompt_audio',
+  'manage_circle', 'rest_call', 'build_ivr_script', 'generate_prompt_audio', 'set_agent_permissions',
   'modify_vcc_configuration', 'patch_ivr_script', 'bulk_create_users',
 ]);
 
 export function toolDefs() {
   return TOOLS.map(({ name, description, inputSchema }) => ({ name, description, inputSchema }));
+}
+
+// Resolve file-prompt NAMES to their real Five9 prompt ids.
+//
+// The SOAP getPrompts list carries no ids. Emitting a file prompt as
+// <id>0</id> + name is accepted on SAVE and survives a round-trip, but the IVR
+// RUNTIME cannot resolve it: the call dies on that module with
+//   IVR.error_code 1600 / IVR.error_desc "Invalid prompt name"
+// (observed live on Orchard 143050, 9/11/2026 — a menu built this way failed on
+// every inbound call, while the same prompt worked in a designer-authored
+// script). Real ids come from the New Platform prompts API.
+async function resolvePromptIds(cfg, names) {
+  const wanted = new Set(names.map((n) => String(n).toLowerCase()));
+  const byName = new Map();
+  const rest = new Five9RestClient(cfg);
+  let cursor = null;
+  do {
+    const page = await rest.listNpPrompts({ cursor, limit: 100 });
+    for (const p of page.items || []) {
+      const key = String(p.name ?? '').toLowerCase();
+      if (wanted.has(key) && p.promptId != null) byName.set(key, { id: String(p.promptId), name: p.name });
+    }
+    cursor = page.nextCursor;
+  } while (cursor && byName.size < wanted.size);
+  return byName;
 }
 
 export async function callTool(cfg, name, args) {
