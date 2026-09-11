@@ -1045,6 +1045,48 @@ export const TOOLS = [
     },
   },
   {
+    name: 'list_phone_numbers',
+    description: 'List the domain phone numbers in COMPACT form: number, area code, city/state, which campaign it is assigned to, and whether voice / SMS / MMS are enabled (plus SMS direction, provider status and 10DLC campaign registry id). Use this instead of rest_call on /numbers/v1 - the raw records are ~120 lines each. Filters: sms_enabled, unassigned, area_code, search (digits anywhere in the number). A number can be assigned to only ONE campaign and carries both voice and SMS, so moving it moves both channels. Read-only.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        sms_enabled: { type: 'boolean', description: 'Only SMS-enabled numbers (false = only non-SMS)' },
+        unassigned: { type: 'boolean', description: 'true = only numbers with no campaign; false = only assigned' },
+        area_code: { type: 'string', description: 'Filter by area code, e.g. "813"' },
+        search: { type: 'string', description: 'Match these digits anywhere in the number' },
+        cursor: { type: 'string', description: 'Pagination cursor (nextCursor from a prior call)' },
+        limit: { type: 'number', description: 'Page size (default 100)' },
+      },
+      additionalProperties: false,
+    },
+    rest: true,
+    handler: (r, a) => r.listPhoneNumbers(a),
+  },
+  {
+    name: 'get_campaign_digital',
+    description: 'Read a campaign\'s DIGITAL settings - maxNumTextInteractions (0 means inbound SMS cannot land on it at all), voice lines, VIVR sessions, timezone, skills, DNIS and default script id. These fields are missing from SOAP get_campaign_details AND from the REST campaign LIST; only a GET by id returns them. Takes campaign_id (from list_campaigns / rest_call) or campaign_name. Read-only.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        campaign_id: { type: 'string', description: 'Campaign id, e.g. 300000000000038' },
+        campaign_name: { type: 'string', description: 'Exact campaign name (resolved to an id first)' },
+      },
+      additionalProperties: false,
+    },
+    rest: true,
+    handler: async (r, a) => {
+      let id = a.campaign_id;
+      if (!id) {
+        if (!a.campaign_name) throw new Error('Pass campaign_id or campaign_name.');
+        const page = await r.listPaged('/campaigns/v1/domains/{domainId}/campaigns', { limit: 200 });
+        const hit = (page.items || []).find((c) => c.name === a.campaign_name);
+        if (!hit) throw new Error(`Campaign "${a.campaign_name}" not found.`);
+        id = hit.campaignId;
+      }
+      return r.getCampaignDigital(id);
+    },
+  },
+  {
     name: 'list_np_prompts',
     description: 'List voice prompts via the OAuth New Platform prompts API (paginated; returns richer objects than the SOAP list_prompts). Requires an OAuth API Access Control credential — see rest_check_connection. Pass cursor (from a prior nextCursor) to page.',
     inputSchema: {
@@ -1381,7 +1423,7 @@ export const TOOL_GROUPS = [
   { name: 'Users & skills', icon: '🧑‍💼', tools: ['list_users', 'get_user_details', 'create_user', 'bulk_create_users', 'modify_user', 'delete_user', 'set_user_roles', 'set_agent_permissions', 'list_user_profiles', 'list_skills', 'get_skill_details', 'manage_skill', 'manage_user_skills', 'list_agent_groups', 'manage_agent_group', 'manage_reason_code'] },
   { name: 'Domain configuration', icon: '🏢', tools: ['list_dispositions', 'manage_disposition', 'list_ivr_scripts', 'get_ivr_script', 'manage_ivr_script', 'list_prompts', 'manage_tts_prompt', 'manage_wav_prompt', 'list_dnis', 'list_call_variables', 'manage_call_variable', 'list_web_connectors', 'manage_web_connector', 'manage_speed_dial', 'get_vcc_configuration', 'modify_vcc_configuration'] },
   { name: 'Reporting & real-time', icon: '📈', tools: ['run_report', 'get_report_result', 'find_calls', 'get_realtime_stats'] },
-  { name: 'New Platform (REST)', icon: '🆕', tools: ['rest_call', 'manage_circle', 'list_np_prompts', 'list_interaction_dispositions', 'get_domain_info', 'list_data_tables', 'get_data_table_rows'] },
+  { name: 'New Platform (REST)', icon: '🆕', tools: ['rest_call', 'manage_circle', 'list_np_prompts', 'list_phone_numbers', 'get_campaign_digital', 'list_interaction_dispositions', 'get_domain_info', 'list_data_tables', 'get_data_table_rows'] },
   { name: 'IVR builder', icon: '🧩', tools: ['validate_ivr_flow', 'render_ivr_flow', 'build_ivr_script', 'list_ivr_modules', 'patch_ivr_script', 'generate_prompt_audio'] },
 ];
 
