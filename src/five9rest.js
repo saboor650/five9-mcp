@@ -66,6 +66,16 @@ export class Five9RestClient {
       this.credentials.default = { key: cfg.restConsumerKey, secret: cfg.restConsumerSecret };
     }
     this.domainId = cfg?.restDomainId || '';
+    // Every New Platform path is /<svc>/v1/domains/{domainId}/... . When
+    // FIVE9_DOMAIN_ID is not configured the placeholder used to expand to the
+    // empty string, producing /campaigns/v1/domains//campaigns — which a few
+    // services tolerate and most answer with a bare 404, so the failure looked
+    // like "that endpoint does not exist" rather than "the domain is missing"
+    // (cost an afternoon on Orchard 143050, 9/11/2026). Resolve it lazily
+    // instead: callers hand us a resolver (SOAP getVCCConfiguration), and an
+    // unresolvable domain is a loud error, never an empty path segment.
+    this._domainIdResolver = typeof cfg?.domainIdResolver === 'function' ? cfg.domainIdResolver : null;
+    this._domainIdPromise = null;
     this.region = (cfg?.restRegion || 'US').toUpperCase();
     this.baseUrl = (cfg?.restBaseUrl || REGION_BASE_URLS[this.region] || REGION_BASE_URLS.US).replace(/\/+$/, '');
     this.maxRetries = 5;
@@ -113,10 +123,36 @@ export class Five9RestClient {
   // Which credential names are configured.
   credentialNames() { return Object.keys(this.credentials).filter((n) => this.credentials[n]?.key); }
 
+  // The domain id, from config or (once, cached) from the resolver.
+  async getDomainId() {
+    if (this.domainId) return this.domainId;
+    if (!this._domainIdResolver) {
+      throw new Five9RestError(
+        'No Five9 domain id available for a New Platform path containing {domainId}. '
+        + 'Set FIVE9_DOMAIN_ID (Admin Console > API Access Control shows it in the endpoint URLs), '
+        + 'or call through callTool() so the SOAP fallback resolver is attached.'
+      );
+    }
+    if (!this._domainIdPromise) {
+      this._domainIdPromise = Promise.resolve()
+        .then(() => this._domainIdResolver())
+        .then((id) => {
+          const v = String(id ?? '').trim();
+          if (!v) throw new Five9RestError('Domain id lookup returned nothing — set FIVE9_DOMAIN_ID explicitly.');
+          this.domainId = v;
+          return v;
+        })
+        .catch((e) => { this._domainIdPromise = null; throw e; });
+    }
+    return this._domainIdPromise;
+  }
+
   // Substitute path placeholders and normalize to a leading slash.
-  _resolvePath(path) {
+  async _resolvePath(path) {
     let p = String(path || '');
-    p = p.replace(/\{domainId\}/g, encodeURIComponent(this.domainId));
+    if (p.includes('{domainId}')) {
+      p = p.replace(/\{domainId\}/g, encodeURIComponent(await this.getDomainId()));
+    }
     if (!p.startsWith('/')) p = '/' + p;
     return p;
   }
@@ -127,7 +163,7 @@ export class Five9RestClient {
     const base = (baseUrl || this.baseUrl).replace(/\/+$/, '');
     assertFive9Host(base); // fail before any token is fetched or sent
     const token = await this.getToken(credential);
-    let url = base + this._resolvePath(path);
+    let url = base + (await this._resolvePath(path));
     if (query && Object.keys(query).length) {
       const qs = new URLSearchParams(query).toString();
       if (qs) url += (url.includes('?') ? '&' : '?') + qs;
@@ -181,11 +217,15 @@ export class Five9RestClient {
   // Acquire a token and report connection metadata (no business call).
   async checkConnection(credential = 'default') {
     await this.getToken(credential);
+    let domainId = null;
+    let domainIdError;
+    try { domainId = await this.getDomainId(); } catch (e) { domainIdError = e.message; }
     return {
       ok: true,
       baseUrl: this.baseUrl,
       region: this.region,
-      domainId: this.domainId || null,
+      domainId,
+      ...(domainIdError ? { domainIdError } : {}),
       credential,
       configuredCredentials: this.credentialNames(),
       tokenType: 'Bearer',
@@ -226,6 +266,62 @@ export class Five9RestClient {
     if (!id) throw new Five9RestError('circle_id is required.');
     await this.request('DELETE', `/circles/v1/domains/{domainId}/circles/${encodeURIComponent(id)}`);
     return { ok: true, deleted: id };
+  }
+
+  // Phone numbers (read). The raw records are ~120 lines each; callers almost
+  // always want the summary, so fold them here rather than in the tool layer.
+  async listPhoneNumbers({ cursor, limit, sms_enabled, unassigned, area_code, search } = {}) {
+    const page = await this.listPaged('/numbers/v1/domains/{domainId}/phone-numbers', { cursor, limit: limit || 100 });
+    let items = page.items || [];
+    if (sms_enabled === true) items = items.filter((n) => n?.sms?.enabled === true);
+    if (sms_enabled === false) items = items.filter((n) => n?.sms?.enabled !== true);
+    if (unassigned === true) items = items.filter((n) => !n?.assigneeName);
+    if (unassigned === false) items = items.filter((n) => !!n?.assigneeName);
+    if (area_code) items = items.filter((n) => n?.geoData?.areaCode === String(area_code));
+    if (search) {
+      const q = String(search).replace(/\D/g, '');
+      if (q) items = items.filter((n) => String(n?.number || '').includes(q));
+    }
+    const numbers = items.map((n) => ({
+      number: n.number,
+      areaCode: n?.geoData?.areaCode ?? null,
+      city: (n?.geoData?.cities || [])[0] ?? null,
+      state: n?.geoData?.state ?? null,
+      assignedTo: n.assigneeName ?? null,
+      voice: n?.voice?.enabled === true,
+      sms: n?.sms?.enabled === true,
+      smsDirection: n?.sms?.direction ?? null,
+      smsProvider: n?.sms?.provider?.providerId ?? null,
+      smsProviderStatus: n?.sms?.provider?.status ?? null,
+      mms: n?.sms?.mms?.enabled === true,
+      campaignRegistryId: n?.sms?.campaignRegistry?.campaignRegistryId ?? null,
+      dnisId: n.dnisId ?? null,
+      comment: n.comment || undefined,
+    }));
+    return { numbers, count: numbers.length, nextCursor: page.nextCursor };
+  }
+
+  // One campaign with the digital fields the SOAP campaign object omits.
+  // NOTE: the LIST endpoint does not return them — you must GET by id.
+  async getCampaignDigital(campaignId) {
+    if (!campaignId) throw new Five9RestError('campaign_id is required.');
+    const { data, etag } = await this.request('GET', `/campaigns/v1/domains/{domainId}/campaigns/${encodeURIComponent(campaignId)}`);
+    return {
+      campaignId: data?.campaignId,
+      name: data?.name,
+      type: data?.type,
+      state: data?.state,
+      timezone: data?.timezone ?? null,
+      maxNumVoiceLines: data?.maxNumVoiceLines ?? null,
+      maxNumTextInteractions: data?.maxNumTextInteractions ?? null,
+      maxNumVivrSessions: data?.maxNumVivrSessions ?? null,
+      smsReady: Number(data?.maxNumTextInteractions || 0) > 0,
+      skills: (data?.skills || []).map((s) => s.skillId),
+      dnises: (data?.dnises || []).map((d) => d.uri?.split('/').pop() || d.numberId),
+      defaultScriptId: data?.defaultScript?.ewScriptId ?? null,
+      etag,
+      note: 'Chat Profile and Digital Skill are not exposed by this API (or by SOAP) - Admin Console only. Do not PUT this endpoint: it ignores dnises and silently drops skills.',
+    };
   }
 
   // New Platform voice prompts (read).
