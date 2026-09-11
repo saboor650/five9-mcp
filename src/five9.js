@@ -1015,6 +1015,50 @@ export class Five9Client {
     return { ok: true, user: userName, added: Object.keys(rolesToSet), removed: rm };
   }
 
+  // Toggle individual AGENT permissions (ReceiveTransfer, CreateChatSessions,
+  // CanTransferChatsToAgents, CanRejectCalls, ...). rolesToSet.agent REPLACES
+  // the whole permission list, so read the current set and merge — otherwise
+  // every permission not named here is silently switched off.
+  //
+  // Users created from the blank "Create User" form come with almost every
+  // agent permission false (Orchard, 9/10/2026), which is what makes this
+  // worth a tool: the alternative is ~10 checkboxes in the classic UI.
+  async setAgentPermissions(userName, { enable, disable } = {}) {
+    const on = toArray(enable).map(String);
+    const off = toArray(disable).map(String);
+    if (!on.length && !off.length) throw new Five9Error('Provide at least one permission in enable or disable.');
+    const details = await this.getUserDetails(userName);
+    const agent = details?.roles?.agent;
+    if (!agent) throw new Five9Error(`User "${userName}" does not have the agent role. Use set_user_roles to add it first.`);
+
+    const current = new Map();
+    for (const p of toArray(agent.permissions)) current.set(String(p.type), String(p.value) === 'true');
+    const known = new Set(current.keys());
+    const unknown = [...on, ...off].filter((t) => !known.has(t));
+    if (unknown.length) {
+      throw new Five9Error(
+        `Unknown agent permission(s): ${unknown.join(', ')}. ` +
+        `Run get_user_details on this user to see the exact names Five9 uses (e.g. ReceiveTransfer, CreateChatSessions, CanTransferChatsToSkills).`
+      );
+    }
+    for (const t of on) current.set(t, true);
+    for (const t of off) current.set(t, false);
+
+    const gi = (await this.admin('getUserGeneralInfo', `<userName>${escapeXml(userName)}</userName>`)).return;
+    if (!gi) throw new Five9Error(`User "${userName}" not found.`);
+    delete gi.fullName;
+    const rolesToSet = {
+      agent: {
+        alwaysRecorded: String(agent.alwaysRecorded) === 'true',
+        attachVmToEmail: String(agent.attachVmToEmail) === 'true',
+        sendEmailOnVm: String(agent.sendEmailOnVm) === 'true',
+        permissions: [...current].map(([type, value]) => ({ type, value })),
+      },
+    };
+    await this.admin('modifyUser', xmlOf(gi, 'userGeneralInfo') + xmlOf(rolesToSet, 'rolesToSet'));
+    return { ok: true, user: userName, enabled: on, disabled: off, totalPermissions: current.size };
+  }
+
   // Web connectors — create / modify / delete.
   //
   // The connector type carries three keyValuePair lists (postVariables,

@@ -309,6 +309,16 @@ function compoundPromptXml(prompt, resolved, ttsXmlBlob, interruptible = false) 
     `<ttsEnumed>${tts}</ttsEnumed><exitModuleOnException>false</exitModuleOnException>`;
   if (prompt.prompt_name) {
     const p = resolved.prompts.get(prompt.prompt_name.toLowerCase());
+    // A file prompt with id 0 saves and round-trips, but the IVR runtime cannot
+    // resolve it and the call dies with error 1600 "Invalid prompt name".
+    // Never emit one.
+    if (!p?.id || String(p.id) === '0') {
+      throw new Error(
+        `Prompt "${prompt.prompt_name}" resolved to no id (got ${p?.id ?? 'undefined'}). ` +
+        'A file prompt written with id 0 fails at runtime with IVR error 1600 "Invalid prompt name". ' +
+        'Resolve real prompt ids (New Platform prompts API) before composing.'
+      );
+    }
     return `<filePrompt><promptData><promptSelected>true</promptSelected>` +
       `<prompt><id>${p.id}</id><name>${escapeXml(p.name)}</name></prompt>` +
       `<isRecordedMessage>false</isRecordedMessage></promptData></filePrompt>${flags(false)}`;

@@ -161,6 +161,35 @@ test('file prompts resolve to domain prompt ids', async () => {
   );
 });
 
+// Regression: Orchard 143050, 9/11/2026. build_ivr_script resolved every file
+// prompt to id 0 on the assumption that Five9 normalises ids server-side. The
+// script SAVED and round-tripped cleanly, but every inbound call died on the
+// menu with IVR.error_code 1600 / "Invalid prompt name". Never emit id 0.
+test('file prompts with a zero or missing id are refused, not emitted', async () => {
+  const flow = {
+    entry: 'p',
+    nodes: {
+      p: { type: 'play', prompt: { prompt_name: 'MainGreeting' }, next: 'h' },
+      h: { type: 'hangup' },
+    },
+  };
+  for (const badId of [0, '0', undefined, null]) {
+    await assert.rejects(
+      () => composeIvrXml(flow, { skills: new Map(), prompts: new Map([['maingreeting', { id: badId, name: 'MainGreeting' }]]) }),
+      /resolved to no id|Invalid prompt name/,
+      `id ${String(badId)} should be refused`,
+    );
+  }
+
+  // A real id still composes, and lands in the XML unchanged.
+  const { xml } = await composeIvrXml(flow, {
+    skills: new Map(),
+    prompts: new Map([['maingreeting', { id: '300000000000011', name: 'MainGreeting' }]]),
+  });
+  assert.match(xml, /<id>300000000000011<\/id>/);
+  assert.doesNotMatch(xml, /<promptSelected>true<\/promptSelected><prompt><id>0<\/id>/);
+});
+
 test('speakXml escapes prompt text', () => {
   const xml = speakXml('Press 1 & say "hi" <now>');
   assert.ok(xml.includes('Press 1 &amp; say &quot;hi&quot; &lt;now&gt;'));
